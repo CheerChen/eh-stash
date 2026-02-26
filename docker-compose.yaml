@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: eh_stash
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d eh_stash"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  scraper:
+    build: ./scraper
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      THUMB_RATE_INTERVAL: ${THUMB_RATE_INTERVAL:-1.0}
+    restart: unless-stopped
+    volumes:
+      - ./scraper:/app
+      - thumbs_data:/data/thumbs
+
+  api:
+    build: ./api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      TAG_BLACKLIST: "male:males only,male:yaoi,female:amputee,female:futanari"
+    restart: unless-stopped
+    volumes:
+      - ./api:/app
+      - thumbs_data:/data/thumbs
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - api
+    ports:
+      - "5173:5173"
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:
+  thumbs_data:
