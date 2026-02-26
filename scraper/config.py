@@ -23,15 +23,6 @@ if EX_COOKIES_STR:
             k, v = pair.split("=", 1)
             COOKIES[k.strip()] = v.strip()
 
-# Scraper Settings
-RATE_INTERVAL = float(os.getenv("RATE_INTERVAL", "1.0"))
-
-# Callback settings
-CALLBACK_DETAIL_QUOTA = int(os.getenv("CALLBACK_DETAIL_QUOTA", "25"))   # detail 请求额度/turn
-CALLBACK_GID_WINDOW = int(os.getenv("CALLBACK_GID_WINDOW", "10000"))      # 每轮跟进窗口: latest_gid - window
-CALLBACK_RATING_DIFF_THRESHOLD = float(os.getenv("CALLBACK_RATING_DIFF_THRESHOLD", "0.5"))
-CALLBACK_INLINE_SET = os.getenv("CALLBACK_INLINE_SET", "dm_l")
-
 # Thumb downloader
 THUMB_DIR = os.getenv("THUMB_DIR", "/data/thumbs")
 THUMB_RATE_INTERVAL = float(os.getenv("THUMB_RATE_INTERVAL", "1.0"))
