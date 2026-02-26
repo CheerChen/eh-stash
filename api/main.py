@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from routers import galleries, stats
+from routers import admin, galleries, stats
 
 THUMB_DIR = Path(os.getenv("THUMB_DIR", "/data/thumbs"))
 
@@ -19,6 +19,7 @@ app.add_middleware(
 
 app.include_router(galleries.router)
 app.include_router(stats.router)
+app.include_router(admin.router)
 
 @app.get("/v1/thumbs/{gid}")
 async def get_thumb(gid: int):

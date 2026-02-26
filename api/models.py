@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, HttpUrl
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 
 class Gallery(BaseModel):
@@ -32,3 +32,38 @@ class Stats(BaseModel):
     by_category: Dict[str, int]
     last_synced_at: Optional[datetime] = None
     queue_status: Dict[str, Any]
+
+
+class SyncTaskCreate(BaseModel):
+    name: str
+    type: Literal["full", "incremental"]
+    category: str
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SyncTaskUpdate(BaseModel):
+    name: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+
+
+class SyncTask(BaseModel):
+    id: int
+    name: str
+    type: str
+    category: str
+    status: str
+    desired_status: str
+    config: Dict[str, Any]
+    state: Dict[str, Any]
+    progress_pct: float
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+
+
+class ThumbQueueStats(BaseModel):
+    pending: int
+    processing: int
+    done: int
+    failed: int
