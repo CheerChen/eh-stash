@@ -1,0 +1,78 @@
+# docker-compose.pi.yaml — 树莓派 / Portainer 生产部署
+
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: eh_stash
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - /opt/eh-stash/db:/var/lib/postgresql/data
+      - /opt/eh-stash/migrations:/docker-entrypoint-initdb.d
+    # 不对宿主机暴露端口，仅内部网络可达
+    expose:
+      - "5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d eh_stash"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  scraper:
+    image: ${REGISTRY_URL:-192.168.0.110:5000}/eh-stash-scraper:${TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      EX_COOKIES: ${EX_COOKIES}
+      EX_BASE_URL: ${EX_BASE_URL:-https://exhentai.org}
+      RATE_INTERVAL: ${RATE_INTERVAL:-1.0}
+      CALLBACK_DETAIL_QUOTA: ${CALLBACK_DETAIL_QUOTA:-25}
+      CALLBACK_SKIP_THRESHOLD: ${CALLBACK_SKIP_THRESHOLD:-5}
+      THUMB_RATE_INTERVAL: ${THUMB_RATE_INTERVAL:-1.0}
+      THUMB_DIR: /data/thumbs
+    volumes:
+      - /opt/eh-stash/thumbs:/data/thumbs
+    networks:
+      - internal
+    restart: unless-stopped
+
+  api:
+    image: ${REGISTRY_URL:-192.168.0.110:5000}/eh-stash-api:${TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      EX_COOKIES: ${EX_COOKIES}
+      EX_BASE_URL: ${EX_BASE_URL:-https://exhentai.org}
+      TAG_BLACKLIST: ${TAG_BLACKLIST:-"male:males only,male:yaoi,female:amputee,female:futanari"}
+      THUMB_DIR: /data/thumbs
+    volumes:
+      - /opt/eh-stash/thumbs:/data/thumbs
+    networks:
+      - internal
+    restart: unless-stopped
+
+  frontend:
+    image: ${REGISTRY_URL:-192.168.0.110:5000}/eh-stash-frontend:${TAG:-latest}
+    depends_on:
+      - api
+    ports:
+      - "4173:4173"   # 宿主 4173 → 容器内 vite preview 4173
+    networks:
+      - internal
+    restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
