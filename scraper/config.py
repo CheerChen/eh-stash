@@ -31,10 +31,13 @@ PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 THUMB_DIR = os.getenv("THUMB_DIR", "/data/thumbs")
 
 # 全局请求速率限制（主站 list/detail，单位：秒/请求）
-RATE_INTERVAL = float(os.getenv("RATE_INTERVAL", "2.0"))
+RATE_INTERVAL = float(os.getenv("RATE_INTERVAL", "5.0"))
 
 # Thumb 下载速率限制（图片 CDN，单位：秒/请求，独立限速）
 THUMB_RATE_INTERVAL = float(os.getenv("THUMB_RATE_INTERVAL", "0.5"))
+
+# Ban 解除后冷却期（秒），避免刚解封就立刻请求触发二次封禁
+BAN_COOLDOWN = float(os.getenv("BAN_COOLDOWN", "60"))
 
 HEADERS = {
     "User-Agent": (
