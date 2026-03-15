@@ -65,7 +65,7 @@ async def _set_ban(seconds: int):
 
 
 async def _wait_if_banned():
-    """如果当前处于 ban 状态，阻塞等待直到 ban 解除"""
+    """如果当前处于 ban 状态，阻塞等待直到 ban 解除，解除后额外冷却"""
     global _ban_until
     if _ban_until <= 0:
         return
@@ -73,7 +73,10 @@ async def _wait_if_banned():
     if remaining > 0:
         logger.info(f"[BAN  ] waiting {remaining:.0f}s for ban to expire...")
         await asyncio.sleep(remaining)
-        logger.info("[BAN  ] ban expired, resuming requests")
+        cooldown = config.BAN_COOLDOWN
+        logger.info(f"[BAN  ] ban expired, cooling down {cooldown:.0f}s before resuming...")
+        await asyncio.sleep(cooldown)
+        logger.info("[BAN  ] cooldown complete, resuming requests")
     _ban_until = 0.0
 
 
@@ -89,6 +92,26 @@ class GlobalRateLimiter:
         # 先等 ban 解除
         await _wait_if_banned()
         async with self._lock:
+            # 二次检查：防止在锁外等待期间其他协程触发了 ban
+            if _ban_until > 0:
+                await _wait_if_banned()
+            now = asyncio.get_event_loop().time()
+            wait = self._interval - (now - self._last_time)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_time = asyncio.get_event_loop().time()
+
+
+class SimpleRateLimiter:
+    """轻量限速器：仅控制请求间隔，不检查 ban 状态（用于 CDN 等独立域名）"""
+
+    def __init__(self, interval: float):
+        self._interval = interval
+        self._lock = asyncio.Lock()
+        self._last_time = 0.0
+
+    async def acquire(self):
+        async with self._lock:
             now = asyncio.get_event_loop().time()
             wait = self._interval - (now - self._last_time)
             if wait > 0:
@@ -97,7 +120,7 @@ class GlobalRateLimiter:
 
 
 _rate_limiter: GlobalRateLimiter | None = None
-_thumb_rate_limiter: GlobalRateLimiter | None = None
+_thumb_rate_limiter: SimpleRateLimiter | None = None
 
 DEFAULT_FULL_CONFIG = {
     "inline_set": "dm_e",
@@ -788,6 +811,11 @@ async def run_task(client: AsyncSession, task_id: int):
 async def run_thumb_worker():
     thumb_dir = Path(config.THUMB_DIR)
     thumb_dir.mkdir(parents=True, exist_ok=True)
+
+    # 启动时清理上次运行残留的 processing 行（进程异常退出时可能遗留）
+    reset_count = db.reset_stale_thumb_processing()
+    if reset_count:
+        logger.info(f"[THUMB] reset {reset_count} stale processing items to pending")
     logger.info(f"[THUMB] worker started, dir={thumb_dir}")
 
     async with AsyncSession(
@@ -801,6 +829,9 @@ async def run_thumb_worker():
     ) as client:
         while True:
             try:
+                # 先 acquire 再 claim：避免 claim 后在 limiter 中阻塞导致 processing 卡死
+                await _thumb_rate_limiter.acquire()
+
                 item = db.claim_next_thumb_queue_item()
                 if not item:
                     await asyncio.sleep(THUMB_IDLE_SLEEP)
@@ -811,7 +842,6 @@ async def run_thumb_worker():
                 thumb_url = item["thumb_url"]
 
                 try:
-                    await _thumb_rate_limiter.acquire()
                     resp = await client.get(
                         thumb_url,
                         timeout=15,
@@ -844,7 +874,7 @@ async def run_loop():
 
     global _rate_limiter, _thumb_rate_limiter
     _rate_limiter = GlobalRateLimiter(config.RATE_INTERVAL)
-    _thumb_rate_limiter = GlobalRateLimiter(config.THUMB_RATE_INTERVAL)
+    _thumb_rate_limiter = SimpleRateLimiter(config.THUMB_RATE_INTERVAL)
     logger.info(f"Global rate limiter: main={config.RATE_INTERVAL}s/req  thumb={config.THUMB_RATE_INTERVAL}s/req")
     if config.PROXY_URL:
         logger.info(f"Proxy enabled: {config.PROXY_URL}")

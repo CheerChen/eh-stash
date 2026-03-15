@@ -241,3 +241,16 @@ def mark_thumb_queue_failed(item_id: int) -> tuple[int, str] | None:
         if not row:
             return None
         return row[0], row[1]
+
+
+def reset_stale_thumb_processing() -> int:
+    """将所有卡在 processing 状态的缩略图任务重置为 pending（用于启动时清理）"""
+    with get_cursor() as (cur, _):
+        cur.execute(
+            """
+            UPDATE thumb_queue
+            SET status = 'pending'
+            WHERE status = 'processing'
+            """
+        )
+        return cur.rowcount
