@@ -7,6 +7,7 @@ VALID_CATEGORIES = [
     "Image Set", "Cosplay", "Asian Porn", "Non-H", "Western",
 ]
 MIXED_CATEGORY = "Mixed"
+FAVORITES_CATEGORY = "Favorites"
 
 class Gallery(BaseModel):
     gid: int
@@ -25,6 +26,9 @@ class Gallery(BaseModel):
     tags: Optional[Dict[str, List[str]]] = None
     last_synced_at: Optional[datetime] = None
     is_active: bool = True
+    is_favorited: bool = False
+    favorited_at: Optional[datetime] = None
+    rec_score: Optional[float] = None
 
 class GalleryList(BaseModel):
     items: List[Gallery]
@@ -42,7 +46,7 @@ class Stats(BaseModel):
 
 class SyncTaskCreate(BaseModel):
     name: str
-    type: Literal["full", "incremental"]
+    type: Literal["full", "incremental", "favorites"]
     category: str
     config: Dict[str, Any] = Field(default_factory=dict)
 
@@ -53,6 +57,11 @@ class SyncTaskCreate(BaseModel):
                 raise ValueError(
                     f"Invalid category '{self.category}'. Must be one of: {', '.join(VALID_CATEGORIES)}"
                 )
+            return self
+
+        if self.type == "favorites":
+            if self.category != FAVORITES_CATEGORY:
+                raise ValueError(f"Favorites task category must be '{FAVORITES_CATEGORY}'")
             return self
 
         if self.category != MIXED_CATEGORY:
@@ -109,3 +118,17 @@ class ThumbQueueStats(BaseModel):
     processing: int
     done: int
     waiting: int
+
+
+class PreferenceTag(BaseModel):
+    namespace: str
+    tag: str
+    weight: float
+    count: float
+
+
+class ScoreDistribution(BaseModel):
+    buckets: List[Dict[str, Any]]  # [{min, max, count}, ...]
+    total: int
+    threshold: float
+    count_above: int

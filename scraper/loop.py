@@ -3,6 +3,7 @@ import logging
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from curl_cffi.requests import AsyncSession
@@ -121,6 +122,7 @@ class SimpleRateLimiter:
 
 _rate_limiter: GlobalRateLimiter | None = None
 _thumb_rate_limiter: SimpleRateLimiter | None = None
+_scorer_reset: asyncio.Event | None = None
 
 DEFAULT_FULL_CONFIG = {
     "inline_set": "dm_e",
@@ -134,6 +136,10 @@ DEFAULT_INCREMENTAL_CONFIG = {
     "rating_diff_threshold": 0.5,
 }
 
+DEFAULT_FAVORITES_CONFIG = {
+    "run_interval_hours": 6,
+}
+
 
 def init_state(task_type: str, task_config: dict) -> dict:
     if task_type == "full":
@@ -144,6 +150,8 @@ def init_state(task_type: str, task_config: dict) -> dict:
             "anchor_gid": None,
             "total_count": None,
         }
+    if task_type == "favorites":
+        return {"round": 0}
     return {
         "next_gid": None,
         "round": 0,
@@ -185,6 +193,15 @@ def normalize_incremental_config(raw: dict | None) -> dict:
     cfg["rating_diff_threshold"] = float(
         cfg_raw.get("rating_diff_threshold") or DEFAULT_INCREMENTAL_CONFIG["rating_diff_threshold"]
     )
+    return cfg
+
+
+def normalize_favorites_config(raw: dict | None) -> dict:
+    cfg = dict(DEFAULT_FAVORITES_CONFIG)
+    try:
+        cfg["run_interval_hours"] = max(1.0, float((raw or {}).get("run_interval_hours", 6)))
+    except (TypeError, ValueError):
+        pass
     return cfg
 
 
@@ -270,7 +287,7 @@ async def fetch_list_page(
     client: AsyncSession,
     categories: list[str],
     inline_set: str,
-    next_gid: int | None = None,
+    next_cursor: str | None = None,
     task_name: str | None = None,
     category_label: str | None = None,
 ):
@@ -280,8 +297,8 @@ async def fetch_list_page(
     fcats = _ALL_CATS - include_mask
     label = category_label or ",".join(categories)
     url = f"{config.EX_BASE_URL}/?f_cats={fcats}&inline_set={inline_set}"
-    if next_gid is not None:
-        url += f"&next={next_gid}"
+    if next_cursor is not None:
+        url += f"&next={next_cursor}"
     _tid = f"name={task_name} " if task_name is not None else ""
 
     try:
@@ -747,6 +764,174 @@ async def run_incremental_once(client: AsyncSession, task_id: int, runtime: dict
     return False
 
 
+# ── Favorites sync ────────────────────────────────────────────────────────────
+
+
+async def fetch_favorites_list_page(
+    client: AsyncSession,
+    next_cursor: str | None = None,
+    task_name: str | None = None,
+):
+    """Fetch a single page from favorites.php using cursor-based pagination."""
+    url = f"{config.EX_BASE_URL}/favorites.php?inline_set=dm_e"
+    if next_cursor is not None:
+        url += f"&next={next_cursor}"
+    _tid = f"[{task_name}] " if task_name else ""
+    try:
+        await _rate_limiter.acquire()
+        logger.info(f"[FAV  ] {_tid}GET {url}")
+        resp = await client.get(url, timeout=30)
+        if resp.status_code != 200:
+            logger.warning(f"[FAV  ] {_tid}HTTP {resp.status_code}")
+            return None
+        if "panda.png" in resp.text or "Sad Panda" in resp.text:
+            logger.error(f"[FAV  ] {_tid}Sad Panda detected")
+            return None
+        if "This page requires you to log on" in resp.text:
+            logger.error(f"[FAV  ] {_tid}Login required")
+            return None
+        if "temporarily banned" in resp.text or "IP address has been" in resp.text:
+            ban_secs = _parse_ban_seconds(resp.text)
+            await _set_ban(ban_secs)
+            return "BANNED"
+        items, next_cursor, total_count = parse_gallery_list(resp.text)
+        return items, next_cursor, total_count
+    except Exception as e:
+        logger.error(f"[FAV  ] {_tid}fetch error: {e}")
+        return None
+
+
+async def run_favorites_once(client: AsyncSession, task_id: int, runtime: dict) -> bool:
+    """Run a single favorites sync cycle.
+
+    Per-page loop: fetch list → backfill missing details → upsert favorites → rebuild preferences.
+    After full traversal: cleanup stale favorites → final rebuild → mark completed.
+    On interrupt: persist next_gid to state for resumption.
+    """
+    _name = runtime["name"]
+    state = runtime.get("state") or {}
+    round_num = int(state.get("round") or 0)
+    cursor = state.get("next_gid")
+    is_resuming = cursor is not None
+    collected_gids: list[int] = []
+    failed_gids: set[int] = set()  # 404 / fetch-failed gids, skip on future pages
+    page_num = 0
+
+    while True:
+        # ── Check desired_status (support interrupt) ──
+        runtime_now = db.get_task_runtime(task_id)
+        if not runtime_now:
+            return True
+        if runtime_now["desired_status"] != "running":
+            db.update_task_runtime(
+                task_id, status="stopped",
+                state={"next_gid": cursor, "round": round_num},
+                touch_run_time=True,
+            )
+            logger.info(f"[FAV  ] [{_name}] stop requested, saved cursor={cursor}")
+            return True
+
+        # ── Fetch one page ──
+        result = await fetch_favorites_list_page(client, cursor, task_name=_name)
+
+        if result is None:
+            logger.warning(f"[FAV  ] [{_name}] fetch failed at cursor={cursor}")
+            db.update_task_runtime(
+                task_id, status="running",
+                state={"next_gid": cursor, "round": round_num},
+                error_message="favorites page fetch failed",
+            )
+            return False
+
+        if result == "BANNED":
+            db.update_task_runtime(
+                task_id, status="running",
+                state={"next_gid": cursor, "round": round_num},
+                error_message="IP temporarily banned by ExHentai, will retry when ban expires",
+            )
+            return False
+
+        items, next_cursor, _ = result
+        page_num += 1
+
+        if not items:
+            logger.info(f"[FAV  ] [{_name}] empty page at cursor={cursor}, end of favorites")
+            break
+
+        page_gids = [item.gid for item in items]
+        logger.info(f"[FAV  ] [{_name}] page {page_num}: items={len(items)} next_gid={next_cursor}")
+
+        # ── Backfill missing galleries ──
+        missing_gids = [g for g in db.get_non_existing_gids(page_gids) if g not in failed_gids]
+        if missing_gids:
+            item_map = {item.gid: item for item in items}
+            logger.info(f"[FAV  ] [{_name}] {len(missing_gids)} galleries need detail fetch")
+            rows_to_upsert = []
+            for gid in missing_gids:
+                item = item_map.get(gid)
+                if not item:
+                    continue
+                detail = await fetch_detail(client, gid, item.token, task_name=_name)
+                if detail == "BANNED":
+                    db.update_task_runtime(
+                        task_id, status="running",
+                        state={"next_gid": cursor, "round": round_num},
+                        error_message="IP temporarily banned during detail backfill",
+                    )
+                    return False
+                if detail:
+                    rows_to_upsert.append(build_upsert_row(gid, item.token, detail))
+                else:
+                    failed_gids.add(gid)
+                    logger.info(f"[FAV  ] [{_name}] gid={gid} detail failed, skipping")
+            if rows_to_upsert:
+                db.upsert_galleries_bulk(rows_to_upsert)
+                logger.info(f"[FAV  ] [{_name}] backfilled {len(rows_to_upsert)} galleries")
+
+        # ── Upsert favorites (per-page) ──
+        fav_pairs = [(item.gid, item.favorited_at) for item in items]
+        fav_count = db.upsert_favorites(fav_pairs)
+        logger.info(f"[FAV  ] [{_name}] upserted {fav_count} favorites")
+
+        # ── Rebuild preference tags (per-page) ──
+        tag_count = db.rebuild_preference_tags()
+        logger.info(f"[FAV  ] [{_name}] rebuilt {tag_count} preference tags")
+        if _scorer_reset:
+            _scorer_reset.set()
+
+        collected_gids.extend(page_gids)
+
+        # ── Update progress & advance cursor ──
+        db.update_task_runtime(
+            task_id, status="running", error_message="",
+            state={"next_gid": next_cursor, "round": round_num},
+        )
+        cursor = next_cursor
+        if cursor is None:
+            break
+
+    # ── Full traversal completed ──
+    if not is_resuming and collected_gids:
+        removed = db.cleanup_stale_favorites(collected_gids)
+        if removed:
+            logger.info(f"[FAV  ] [{_name}] cleanup: removed {removed} stale favorites")
+            tag_count = db.rebuild_preference_tags()
+            logger.info(f"[FAV  ] [{_name}] rebuilt {tag_count} preference tags after cleanup")
+            if _scorer_reset:
+                _scorer_reset.set()
+
+    logger.info(f"[FAV  ] [{_name}] completed round={round_num + 1}, total={len(collected_gids)} favorites")
+    db.update_task_runtime(
+        task_id,
+        state={"next_gid": None, "round": round_num + 1},
+        status="completed",
+        progress_pct=100.0,
+        error_message="",
+        touch_run_time=True,
+    )
+    return True
+
+
 async def run_task(client: AsyncSession, task_id: int):
     logger.info(f"[TASK ] start id={task_id}")
 
@@ -772,6 +957,8 @@ async def run_task(client: AsyncSession, task_id: int):
                     db.update_task_runtime(task_id, status="error", error_message=msg, touch_run_time=True)
                     db.set_task_desired_status(task_id, "stopped")
                     return
+            elif runtime["type"] == "favorites":
+                pass  # No special validation needed
             else:
                 category = runtime.get("category", "")
                 if category != MIXED_CATEGORY:
@@ -793,6 +980,10 @@ async def run_task(client: AsyncSession, task_id: int):
 
             if runtime["type"] == "full":
                 done = await run_full_once(client, task_id, runtime)
+                if done:
+                    return
+            elif runtime["type"] == "favorites":
+                done = await run_favorites_once(client, task_id, runtime)
                 if done:
                     return
             else:
@@ -866,15 +1057,69 @@ async def run_thumb_worker():
                 await asyncio.sleep(10)
 
 
+SCORER_BATCH_SIZE = 100
+SCORER_BATCH_INTERVAL = 0.1  # seconds between batches (pure DB, no rate limit needed)
+SCORER_IDLE_INTERVAL = 30    # seconds to wait when fully scored before rechecking
+
+
+async def run_recommended_scorer():
+    """Background coroutine that incrementally computes recommended_cache.
+    Processes galleries in batches of SCORER_BATCH_SIZE, gid DESC.
+    Resets to latest when _scorer_reset event is set (preference_tags changed).
+    """
+    global _scorer_reset
+    cursor: int | None = None
+
+    logger.info("[SCORE] recommended scorer started")
+
+    while True:
+        try:
+            # Check for reset signal (non-blocking)
+            if _scorer_reset and _scorer_reset.is_set():
+                _scorer_reset.clear()
+                cursor = None
+                logger.info("[SCORE] reset: restarting from latest gid")
+
+            gids, next_cursor = db.score_recommended_batch(cursor, SCORER_BATCH_SIZE)
+
+            if not gids:
+                # No more galleries to process or no preference data
+                if cursor is not None:
+                    logger.info("[SCORE] full scan complete, idling")
+                    cursor = None
+                # Wait for reset or periodic recheck
+                if _scorer_reset:
+                    try:
+                        await asyncio.wait_for(_scorer_reset.wait(), timeout=SCORER_IDLE_INTERVAL)
+                        _scorer_reset.clear()
+                        cursor = None
+                        logger.info("[SCORE] reset: restarting from latest gid")
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(SCORER_IDLE_INTERVAL)
+                continue
+
+            cursor = next_cursor
+            await asyncio.sleep(SCORER_BATCH_INTERVAL)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[SCORE] error: {e}")
+            await asyncio.sleep(10)
+
+
 async def run_loop():
     logger.info("Starting DB-driven sync scheduler...")
 
     if any("YOUR_" in v for v in config.COOKIES.values()):
         logger.warning("Default cookies detected in .env, update EX_COOKIES.")
 
-    global _rate_limiter, _thumb_rate_limiter
+    global _rate_limiter, _thumb_rate_limiter, _scorer_reset
     _rate_limiter = GlobalRateLimiter(config.RATE_INTERVAL)
     _thumb_rate_limiter = SimpleRateLimiter(config.THUMB_RATE_INTERVAL)
+    _scorer_reset = asyncio.Event()
     logger.info(f"Global rate limiter: main={config.RATE_INTERVAL}s/req  thumb={config.THUMB_RATE_INTERVAL}s/req")
     if config.PROXY_URL:
         logger.info(f"Proxy enabled: {config.PROXY_URL}")
@@ -897,6 +1142,7 @@ async def run_loop():
             sys.exit(1)
 
         thumb_task = asyncio.create_task(run_thumb_worker(), name="thumb-worker")
+        scorer_task = asyncio.create_task(run_recommended_scorer(), name="recommended-scorer")
 
         logger.info(f"[SCHED] warmup: waiting {WARMUP_DELAY}s before starting task scheduler...")
         await asyncio.sleep(WARMUP_DELAY)
@@ -933,6 +1179,14 @@ async def run_loop():
 
                     if desired == "running":
                         if task_obj is None:
+                            # Favorites tasks: wait for run_interval_hours between runs
+                            if row["type"] == "favorites" and row["status"] == "completed":
+                                interval_hours = (row.get("config") or {}).get("run_interval_hours", 6)
+                                last_run = row.get("last_run_at")
+                                if last_run:
+                                    elapsed = datetime.now(timezone.utc) - last_run
+                                    if elapsed < timedelta(hours=interval_hours):
+                                        continue
                             running_tasks[task_id] = asyncio.create_task(
                                 run_task(client, task_id),
                                 name=f"sync-task-{task_id}",
@@ -943,6 +1197,7 @@ async def run_loop():
 
                 await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
         finally:
+            scorer_task.cancel()
             thumb_task.cancel()
             for task_obj in running_tasks.values():
                 task_obj.cancel()

@@ -1,7 +1,10 @@
 import React from 'react';
 import GalleryPage from './pages/GalleryPage';
+import FavoritesPage from './pages/FavoritesPage';
+import RecommendedPage from './pages/RecommendedPage';
 import AdminPage from './pages/AdminPage';
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom';
+import { Heart, LayoutGrid, Sparkles } from 'lucide-react';
 
 function App() {
   return (
@@ -16,11 +19,32 @@ function App() {
                 to="/"
                 end
                 className={({ isActive }) =>
-                  `px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${isActive ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'
+                  `px-3 py-1.5 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${isActive ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'
                   }`
                 }
               >
+                <LayoutGrid size={13} />
                 Gallery
+              </NavLink>
+              <NavLink
+                to="/recommended"
+                className={({ isActive }) =>
+                  `px-3 py-1.5 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${isActive ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'
+                  }`
+                }
+              >
+                <Sparkles size={13} />
+                For You
+              </NavLink>
+              <NavLink
+                to="/favorites"
+                className={({ isActive }) =>
+                  `px-3 py-1.5 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${isActive ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'
+                  }`
+                }
+              >
+                <Heart size={13} />
+                Favorites
               </NavLink>
               <NavLink
                 to="/admin"
@@ -38,7 +62,9 @@ function App() {
         {/* Main */}
         <main className="flex-1 max-w-screen-2xl mx-auto w-full px-4 pt-4">
           <Routes>
-            <Route path="/" element={<GalleryPage />} />
+            <Route path="/" element={<GalleryPage key="gallery" />} />
+            <Route path="/recommended" element={<RecommendedPage key="recommended" />} />
+            <Route path="/favorites" element={<FavoritesPage key="favorites" />} />
             <Route path="/admin" element={<AdminPage />} />
           </Routes>
         </main>

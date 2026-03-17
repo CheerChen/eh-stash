@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { Search, X, ChevronDown, ChevronUp, SlidersHorizontal } from 'lucide-react';
 
 const CATEGORIES = [
@@ -34,50 +34,58 @@ const SUGGESTION_LIMIT = 8;
 
 const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
   const [collapsed, setCollapsed] = useState(true);
-  const [tagInput, setTagInput] = useState(filters.tag || '');
+  const [tagInput, setTagInput] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [activeSuggestion, setActiveSuggestion] = useState(-1);
   const tagInputRef = useRef(null);
 
-  // Sync external tag changes (e.g. from tag badge clicks)
-  useEffect(() => {
-    setTagInput(filters.tag || '');
-    setActiveSuggestion(-1);
-  }, [filters.tag]);
+  const tags = filters.tags || [];
 
   const filteredSuggestions = useMemo(() => {
     const keyword = tagInput.trim().toLowerCase();
+    const selected = new Set(tags);
     const hits = keyword
-      ? tagSuggestions.filter((tag) => tag.toLowerCase().includes(keyword))
-      : tagSuggestions;
+      ? tagSuggestions.filter((tag) => !selected.has(tag) && tag.toLowerCase().includes(keyword))
+      : tagSuggestions.filter((tag) => !selected.has(tag));
     return hits.slice(0, SUGGESTION_LIMIT);
-  }, [tagInput, tagSuggestions]);
+  }, [tagInput, tagSuggestions, tags]);
 
   const set = (field) => (e) => onChange({ ...filters, [field]: e.target.value });
 
+  const addTag = (val) => {
+    if (!val || tags.includes(val)) return;
+    onChange({ ...filters, tags: [...tags, val] });
+  };
+
+  const removeTag = (val) => {
+    onChange({ ...filters, tags: tags.filter((t) => t !== val) });
+  };
+
   const commitTag = () => {
     const val = tagInput.trim();
-    if (val !== filters.tag) onChange({ ...filters, tag: val });
+    if (val) {
+      addTag(val);
+      setTagInput('');
+    }
   };
 
   const selectSuggestion = (value) => {
-    setTagInput(value);
+    setTagInput('');
     setShowSuggestions(false);
     setActiveSuggestion(-1);
-    if (value !== filters.tag) onChange({ ...filters, tag: value });
+    addTag(value);
   };
 
   const clearTag = () => {
     setTagInput('');
     setShowSuggestions(false);
     setActiveSuggestion(-1);
-    onChange({ ...filters, tag: '' });
   };
 
-  // Count active API filters: category, tag, min_fav
+  // Count active API filters: category, tags, min_fav
   const activeCount = [
     filters.category,
-    filters.tag,
+    tags.length > 0 ? true : null,
     filters.min_fav > 0 ? filters.min_fav : null,
   ].filter(Boolean).length;
 
@@ -134,6 +142,26 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
           {/* Tag search */}
           <div className="flex flex-col gap-1 flex-1 min-w-[160px]">
             <label className="text-[10px] font-medium text-gray-500 uppercase tracking-wider">Tag</label>
+            {/* Selected tag pills */}
+            {tags.length > 0 && (
+              <div className="flex flex-wrap gap-1 mb-1">
+                {tags.map((t) => (
+                  <span
+                    key={t}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-500/20 text-blue-300 text-xs border border-blue-500/30"
+                  >
+                    {t}
+                    <button
+                      type="button"
+                      onClick={() => removeTag(t)}
+                      className="hover:text-white transition-colors"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="relative">
               <div className="relative flex items-center">
                 <Search size={13} className="absolute left-2.5 text-gray-500 pointer-events-none" />
@@ -187,8 +215,8 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
                         selectSuggestion(filteredSuggestions[activeSuggestion]);
                         return;
                       }
+                      e.preventDefault();
                       commitTag();
-                      e.currentTarget.blur();
                     }
                   }}
                   placeholder="female:solo"
@@ -213,11 +241,10 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => selectSuggestion(suggestion)}
-                      className={`w-full px-3 py-2 text-left text-xs transition-colors ${
-                        idx === activeSuggestion
+                      className={`w-full px-3 py-2 text-left text-xs transition-colors ${idx === activeSuggestion
                           ? 'bg-blue-500/20 text-blue-200'
                           : 'text-gray-300 hover:bg-white/10 hover:text-white'
-                      }`}
+                        }`}
                     >
                       {suggestion}
                     </button>
@@ -234,7 +261,7 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
           {activeCount > 0 && (
             <button
               type="button"
-              onClick={() => onChange({ ...filters, category: '', min_fav: 0, tag: '' })}
+              onClick={() => onChange({ ...filters, category: '', min_fav: 0, tags: [] })}
               className="self-end mb-0.5 px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-white hover:bg-white/10 transition-all border border-white/10"
             >
               Reset

@@ -55,3 +55,15 @@ export function deleteTask(id, confirm = false) {
 export function getThumbStats() {
   return request('/thumb-queue/stats');
 }
+
+export function getScoreDistribution() {
+  return request('/recommended/distribution');
+}
+
+export function updateThreshold(threshold) {
+  return request('/recommended/threshold', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ threshold }),
+  });
+}

@@ -254,3 +254,184 @@ def reset_stale_thumb_processing() -> int:
             """
         )
         return cur.rowcount
+
+
+# ── Favorites & Preferences ──────────────────────────────────────────────────
+
+
+def upsert_favorites(favorites: list[tuple[int, str | None]]) -> int:
+    """Insert new favorites (additive only, called per-page).
+    Only inserts gids that exist in eh_galleries (FK safety).
+    favorites: list of (gid, favorited_at_str) tuples.
+    """
+    if not favorites:
+        return 0
+    gids = [f[0] for f in favorites]
+    fav_map = {f[0]: f[1] for f in favorites}
+    with get_cursor() as (cur, _):
+        cur.execute(
+            """
+            INSERT INTO user_favorites (gid, favorited_at)
+            SELECT v.gid,
+                   COALESCE((ts.val)::timestamptz, NOW())
+            FROM unnest(%(gids)s::bigint[]) AS v(gid)
+            JOIN eh_galleries g ON g.gid = v.gid
+            LEFT JOIN (
+                SELECT * FROM unnest(%(gids)s::bigint[], %(ts)s::text[])
+                    AS t(gid, val)
+            ) ts ON ts.gid = v.gid
+            ON CONFLICT (gid) DO UPDATE SET favorited_at = EXCLUDED.favorited_at
+            """,
+            {
+                "gids": gids,
+                "ts": [fav_map.get(gid) for gid in gids],
+            },
+        )
+        return cur.rowcount
+
+
+def cleanup_stale_favorites(all_gids: list[int]) -> int:
+    """Remove user-canceled favorites (gallery still active but no longer in favorites).
+    Called once after a full traversal of all favorites pages.
+    """
+    if not all_gids:
+        with get_cursor() as (cur, _):
+            cur.execute(
+                "DELETE FROM user_favorites "
+                "WHERE gid IN (SELECT gid FROM eh_galleries WHERE is_active = TRUE)"
+            )
+            return cur.rowcount
+
+    with get_cursor() as (cur, _):
+        cur.execute(
+            """
+            DELETE FROM user_favorites
+            WHERE gid NOT IN (SELECT unnest(%(gids)s::bigint[]))
+              AND gid IN (SELECT gid FROM eh_galleries WHERE is_active = TRUE)
+            """,
+            {"gids": all_gids},
+        )
+        return cur.rowcount
+
+
+def get_non_existing_gids(gids: list[int]) -> list[int]:
+    """Find gids not present in eh_galleries."""
+    if not gids:
+        return []
+    with get_cursor() as (cur, _):
+        cur.execute(
+            """
+            SELECT v.gid
+            FROM unnest(%(gids)s::bigint[]) AS v(gid)
+            LEFT JOIN eh_galleries g ON g.gid = v.gid
+            WHERE g.gid IS NULL
+            """,
+            {"gids": gids},
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def rebuild_preference_tags() -> int:
+    """Rebuild preference_tags from current user_favorites.
+
+    weight = (1 + ln(TF)) × ln(N / df)   (sublinear TF-IDF)
+    count  = raw occurrence count in favorites (pure TF)
+    """
+    with get_cursor() as (cur, _):
+        cur.execute("TRUNCATE preference_tags")
+        cur.execute(
+            """
+            WITH fav_tf AS (
+                SELECT ns, tag_value, COUNT(*)::REAL AS tf
+                FROM eh_galleries g
+                JOIN user_favorites f ON g.gid = f.gid,
+                     jsonb_each(g.tags) AS t(ns, vals),
+                     jsonb_array_elements_text(vals) AS tag_value
+                WHERE ns IN ('artist', 'group', 'character', 'parody')
+                GROUP BY ns, tag_value
+            ),
+            doc_freq AS (
+                SELECT ns, tag_value, COUNT(DISTINCT g.gid)::REAL AS df
+                FROM eh_galleries g,
+                     jsonb_each(g.tags) AS t(ns, vals),
+                     jsonb_array_elements_text(vals) AS tag_value
+                WHERE g.is_active = TRUE
+                  AND ns IN ('artist', 'group', 'character', 'parody')
+                GROUP BY ns, tag_value
+            ),
+            total AS (
+                SELECT COUNT(*)::REAL AS n FROM eh_galleries WHERE is_active = TRUE
+            )
+            INSERT INTO preference_tags (namespace, tag, weight, count)
+            SELECT f.ns, f.tag_value,
+                   (1.0 + LN(f.tf)) * LN(total.n / GREATEST(d.df, 1)),
+                   f.tf
+            FROM fav_tf f
+            JOIN doc_freq d ON d.ns = f.ns AND d.tag_value = f.tag_value
+            CROSS JOIN total
+            """
+        )
+        return cur.rowcount
+
+
+def score_recommended_batch(cursor_gid: int | None, batch_size: int = 100) -> tuple[list[int], int | None]:
+    """Score a batch of galleries and upsert into recommended_cache.
+    Processes galleries in gid DESC order starting after cursor_gid.
+    Returns (scored_gids, next_cursor_gid) where next_cursor_gid is None when done.
+    """
+    with get_cursor() as (cur, _):
+        # Check if preference_tags has data
+        cur.execute("SELECT 1 FROM preference_tags LIMIT 1")
+        if not cur.fetchone():
+            return [], None
+
+        if cursor_gid is None:
+            cur.execute(
+                "SELECT gid FROM eh_galleries WHERE is_active = TRUE ORDER BY gid DESC LIMIT %s",
+                (batch_size,),
+            )
+        else:
+            cur.execute(
+                "SELECT gid FROM eh_galleries WHERE is_active = TRUE AND gid < %s ORDER BY gid DESC LIMIT %s",
+                (cursor_gid, batch_size),
+            )
+        gids = [row[0] for row in cur.fetchall()]
+        if not gids:
+            return [], None
+
+        cur.execute(
+            """
+            INSERT INTO recommended_cache (gid, rec_score)
+            SELECT g.gid, SUM(p.weight)
+            FROM preference_tags p
+            JOIN eh_galleries g
+              ON g.tags @> jsonb_build_object(p.namespace, jsonb_build_array(p.tag))
+            WHERE g.gid = ANY(%(gids)s)
+            GROUP BY g.gid
+            HAVING SUM(p.weight) >= 20
+            ON CONFLICT (gid) DO UPDATE SET rec_score = EXCLUDED.rec_score
+            """,
+            {"gids": gids},
+        )
+        scored = cur.rowcount
+
+        # Remove gids that no longer meet threshold
+        cur.execute(
+            """
+            DELETE FROM recommended_cache
+            WHERE gid = ANY(%(gids)s)
+              AND gid NOT IN (
+                  SELECT g.gid
+                  FROM preference_tags p
+                  JOIN eh_galleries g
+                    ON g.tags @> jsonb_build_object(p.namespace, jsonb_build_array(p.tag))
+                  WHERE g.gid = ANY(%(gids)s)
+                  GROUP BY g.gid
+                  HAVING SUM(p.weight) >= 20
+              )
+            """,
+            {"gids": gids},
+        )
+
+        next_cursor = gids[-1] if len(gids) == batch_size else None
+        return gids, next_cursor

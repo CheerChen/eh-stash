@@ -62,6 +62,12 @@ function GridCard({ gallery }) {
         <span className={`absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold text-white ${catStyle}`}>
           {category}
         </span>
+        {/* Favorites badge */}
+        {gallery.is_favorited && (
+          <span className="absolute top-1.5 left-1.5">
+            <Heart size={12} className="fill-rose-400 text-rose-400 drop-shadow" />
+          </span>
+        )}
       </div>
 
       {/* Meta — flex-1 so it fills remaining height; justify-between pins stats to bottom */}
@@ -134,6 +140,7 @@ function ListRow({ gallery, onTagSearch, translate }) {
             rel="noopener noreferrer"
             className="text-sm font-medium text-gray-200 hover:text-white line-clamp-2 leading-snug"
           >
+            {gallery.is_favorited && <Heart size={12} className="inline fill-rose-400 text-rose-400 mr-1 -mt-0.5" />}
             {displayTitle}
           </a>
           <a
