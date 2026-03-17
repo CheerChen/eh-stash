@@ -1,9 +1,12 @@
 import os
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from typing import List
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from routers import admin, galleries, stats
+from db import get_db
+from models import PreferenceTag
 
 THUMB_DIR = Path(os.getenv("THUMB_DIR", "/data/thumbs"))
 
@@ -35,3 +38,9 @@ async def get_thumb(gid: int):
 @app.get("/")
 def root():
     return {"message": "EH-Stash API is running"}
+
+@app.get("/v1/preferences", response_model=List[PreferenceTag])
+def get_preferences(db=Depends(get_db)):
+    db.execute("SELECT namespace, tag, weight, count FROM preference_tags ORDER BY weight DESC")
+    rows = db.fetchall()
+    return [PreferenceTag(namespace=r[0], tag=r[1], weight=r[2], count=r[3]) for r in rows]

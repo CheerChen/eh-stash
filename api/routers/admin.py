@@ -1,11 +1,15 @@
 import json
+import math
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 
 from db import get_db
 from models import (
+    FAVORITES_CATEGORY,
     MIXED_CATEGORY,
+    ScoreDistribution,
     SyncTask,
     SyncTaskCreate,
     SyncTaskUpdate,
@@ -27,6 +31,10 @@ DEFAULT_INCREMENTAL_CONFIG = {
     "rating_diff_threshold": 0.5,
 }
 
+DEFAULT_FAVORITES_CONFIG = {
+    "run_interval_hours": 6,
+}
+
 
 def _init_state(task_type: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     if task_type == "full":
@@ -37,6 +45,8 @@ def _init_state(task_type: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
             "anchor_gid": None,
             "total_count": None,
         }
+    if task_type == "favorites":
+        return {"round": 0}
     return {
         "next_gid": None,
         "round": 0,
@@ -51,6 +61,14 @@ def _normalize_config(task_type: str, config: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(DEFAULT_FULL_CONFIG)
         merged["start_gid"] = raw.get("start_gid")
         merged["inline_set"] = "dm_e"  # 始终写死，不允许覆盖
+        return merged
+
+    if task_type == "favorites":
+        merged = dict(DEFAULT_FAVORITES_CONFIG)
+        try:
+            merged["run_interval_hours"] = max(1, float(raw.get("run_interval_hours", 6)))
+        except (TypeError, ValueError):
+            pass
         return merged
 
     # incremental: strict schema, no legacy keys compatibility.
@@ -121,6 +139,16 @@ def create_task(payload: SyncTaskCreate, db=Depends(get_db)):
             raise HTTPException(
                 status_code=409,
                 detail=f"Only one incremental task is allowed (existing id={existing[0]} name={existing[1]})",
+            )
+    elif payload.type == "favorites":
+        if payload.category != FAVORITES_CATEGORY:
+            raise HTTPException(status_code=422, detail=f"favorites category must be '{FAVORITES_CATEGORY}'")
+        db.execute("SELECT id, name FROM sync_tasks WHERE type = 'favorites' LIMIT 1")
+        existing = db.fetchone()
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only one favorites task is allowed (existing id={existing[0]} name={existing[1]})",
             )
 
     cfg = _normalize_config(payload.type, payload.config)
@@ -194,7 +222,7 @@ def patch_task(task_id: int, payload: SyncTaskUpdate, db=Depends(get_db)):
 @router.post("/tasks/{task_id}/start", response_model=SyncTask)
 def start_task(task_id: int, db=Depends(get_db)):
     task = _get_task_or_404(task_id, db)
-    if task.status == "completed":
+    if task.status == "completed" and task.type != "favorites":
         raise HTTPException(status_code=409, detail="Completed task cannot be started")
     if task.desired_status == "running":
         return task
@@ -232,7 +260,9 @@ def delete_task(task_id: int, confirm: bool = Query(False), db=Depends(get_db)):
 
     task = _get_task_or_404(task_id, db)
     if task.status == "running" or task.desired_status == "running":
-        raise HTTPException(status_code=409, detail="Stop task before deleting")
+        # Allow deleting favorites tasks in scheduled state (completed but desired=running)
+        if not (task.type == "favorites" and task.status == "completed"):
+            raise HTTPException(status_code=409, detail="Stop task before deleting")
     if _is_transitioning(task):
         raise HTTPException(status_code=409, detail="Task transition in progress")
 
@@ -262,3 +292,59 @@ def thumb_queue_stats(db=Depends(get_db)):
         done=row[2],
         waiting=row[3],
     )
+
+
+# ── Recommended Score Distribution ────────────────────────────────────────────
+
+_recommend_threshold: float = 20.0
+
+
+@router.get("/recommended/distribution", response_model=ScoreDistribution)
+def recommended_distribution(buckets: int = Query(40, ge=10, le=200), db=Depends(get_db)):
+    threshold = _recommend_threshold
+
+    # Get score range
+    db.execute("SELECT MIN(rec_score), MAX(rec_score), COUNT(*) FROM recommended_cache")
+    row = db.fetchone()
+    min_score, max_score, total = row
+    if not total or total == 0:
+        return ScoreDistribution(buckets=[], total=0, threshold=threshold, count_above=0)
+
+    # Build histogram with width_bucket
+    bucket_width = (max_score - min_score) / buckets if max_score > min_score else 1.0
+    db.execute(
+        """
+        SELECT
+            width_bucket(rec_score, %(min)s, %(max_adj)s, %(n)s) AS bucket,
+            COUNT(*) AS cnt
+        FROM recommended_cache
+        GROUP BY bucket
+        ORDER BY bucket
+        """,
+        {"min": min_score, "max_adj": max_score + 0.001, "n": buckets},
+    )
+    bucket_map = {r[0]: r[1] for r in db.fetchall()}
+    result = []
+    for i in range(1, buckets + 1):
+        lo = min_score + (i - 1) * bucket_width
+        hi = min_score + i * bucket_width
+        result.append({"min": round(lo, 2), "max": round(hi, 2), "count": bucket_map.get(i, 0)})
+
+    # Count above threshold
+    db.execute("SELECT COUNT(*) FROM recommended_cache WHERE rec_score >= %s", (threshold,))
+    count_above = db.fetchone()[0]
+
+    return ScoreDistribution(buckets=result, total=total, threshold=threshold, count_above=count_above)
+
+
+class ThresholdUpdate(BaseModel):
+    threshold: float
+
+
+@router.put("/recommended/threshold")
+def update_threshold(payload: ThresholdUpdate):
+    global _recommend_threshold
+    if payload.threshold < 0:
+        raise HTTPException(status_code=422, detail="Threshold must be non-negative")
+    _recommend_threshold = payload.threshold
+    return {"threshold": payload.threshold}

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from bs4 import BeautifulSoup, Tag
 
 GID_TOKEN_RE = re.compile(r"/g/(\d+)/([a-f0-9]+)/")
-NEXT_CURSOR_RE = re.compile(r'[?&]next=(\d+)')
+NEXT_CURSOR_RE = re.compile(r'[?&]next=([^&"\s]+)')
 RATING_RE = re.compile(r"([0-5](?:\.\d+)?)")
 TOTAL_COUNT_RE = re.compile(r"Found\s+(?:about\s+)?([\d,]+)\s+results")
 TAG_CLASS_RE = re.compile(r"^gt")
@@ -19,6 +19,7 @@ class GalleryListItem:
     rating_sig: str
     rating_est: float | None
     visible_tags: tuple[str, ...]
+    favorited_at: str | None = None
 
 
 def _normalize_text(value: str) -> str:
@@ -148,6 +149,15 @@ def parse_gallery_list(html: str) -> tuple[list[GalleryListItem], int | None, in
         rating_sig, rating_est = _extract_rating_signal(element)
         visible_tags = _extract_visible_tags(element)
 
+        # Extract "Favorited: YYYY-MM-DD HH:MM" from favorites.php pages
+        fav_at: str | None = None
+        for p_tag in element.find_all("p"):
+            if p_tag.get_text(strip=True) == "Favorited:":
+                next_p = p_tag.find_next_sibling("p")
+                if next_p:
+                    fav_at = next_p.get_text(strip=True) or None
+                break
+
         results.append(
             GalleryListItem(
                 gid=gid,
@@ -156,20 +166,22 @@ def parse_gallery_list(html: str) -> tuple[list[GalleryListItem], int | None, in
                 rating_sig=rating_sig,
                 rating_est=rating_est,
                 visible_tags=tuple(sorted(visible_tags)),
+                favorited_at=fav_at,
             )
         )
 
     # 从分页栏提取下一页游标
-    # ExHentai 分页: id="dnext" 为"下一页"按钮，href 含 next=<gid>
-    next_gid: int | None = None
+    # ExHentai 分页: id="dnext" 为"下一页"按钮，href 含 next=<cursor>
+    # 画廊列表: next=12345 (纯 gid)；收藏页: next=12345-1762499308 (gid-timestamp)
+    next_cursor: str | None = None
     dnext = soup.find(id="dnext")
     if dnext:
         href = dnext.get("href", "")
         m = NEXT_CURSOR_RE.search(href)
         if m:
-            next_gid = int(m.group(1))
+            next_cursor = m.group(1)
 
-    return results, next_gid, total_count
+    return results, next_cursor, total_count
 
 
 def parse_detail(html: str) -> dict:

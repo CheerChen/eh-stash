@@ -5,11 +5,24 @@ const api = axios.create({
 });
 
 export const fetchGalleries = async (params) => {
-  const { data } = await api.get('/galleries', { params });
+  const { tags, ...rest } = params;
+  const query = new URLSearchParams();
+  for (const [k, v] of Object.entries(rest)) {
+    if (v !== undefined && v !== null && v !== '') query.append(k, v);
+  }
+  if (Array.isArray(tags)) {
+    for (const t of tags) { if (t) query.append('tag', t); }
+  }
+  const { data } = await api.get(`/galleries?${query.toString()}`);
   return data;
 };
 
 export const fetchStats = async () => {
   const { data } = await api.get('/stats');
+  return data;
+};
+
+export const fetchPreferences = async () => {
+  const { data } = await api.get('/preferences');
   return data;
 };

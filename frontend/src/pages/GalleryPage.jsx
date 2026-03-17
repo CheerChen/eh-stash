@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { LayoutGrid, LayoutList, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Loader2, AlertCircle, Heart, Star, MessageCircle, Calendar, ChevronDown, Languages } from 'lucide-react';
+import { LayoutGrid, LayoutList, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Loader2, AlertCircle, Heart, Star, MessageCircle, Calendar, ChevronDown, Languages, Sparkles } from 'lucide-react';
 import { fetchGalleries } from '../api';
 import GalleryCard from '../components/GalleryCard';
 import FilterPanel from '../components/FilterPanel';
@@ -155,24 +155,30 @@ function PaginationBar({ page, totalPages, onPageChange }) {
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
-const GalleryPage = () => {
+const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState({
     category: '',
-    sort: 'fav_count',
+    sort: (favoritesOnly || recommendedOnly) ? 'posted_at' : 'fav_count',
     min_rating: 0,
     min_fav: 0,
-    tag: '',
+    tags: [],
+    is_favorited: favoritesOnly,
   });
   const [viewMode, setViewMode] = useState(getInitialViewMode);
   const [showTranslation, setShowTranslation] = useState(false);
   const { translate } = useTagTranslation(showTranslation);
 
+  const apiSort = recommendedOnly ? 'recommended' : 'gid_desc';
+
   const { data, isLoading, isError, error } = useQuery({
-    queryKey: ['galleries', page, filters.category, filters.min_fav, filters.tag],
+    queryKey: ['galleries', page, apiSort, filters.category, filters.min_fav, filters.tags, filters.is_favorited],
     queryFn: () => {
-      const { sort, min_rating, ...apiFilters } = filters;
-      return fetchGalleries({ page, page_size: PAGE_SIZE, sort: 'gid_desc', ...apiFilters });
+      const { sort, min_rating, is_favorited, tags, ...apiFilters } = filters;
+      const params = { page, page_size: PAGE_SIZE, sort: apiSort, tags, ...apiFilters };
+      if (is_favorited) params.is_favorited = true;
+      if (recommendedOnly) params.is_favorited = false;
+      return fetchGalleries(params);
     },
     keepPreviousData: true,
   });
@@ -184,7 +190,13 @@ const GalleryPage = () => {
 
   const handleTagSearch = useCallback((tag) => {
     if (!tag) return;
-    setFilters((prev) => ({ ...prev, tag }));
+    setFilters((prev) => {
+      const tags = prev.tags || [];
+      if (tags.includes(tag)) {
+        return { ...prev, tags: tags.filter((t) => t !== tag) };
+      }
+      return { ...prev, tags: [...tags, tag] };
+    });
     setPage(1);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
@@ -204,9 +216,8 @@ const GalleryPage = () => {
   const totalPages = data?.pages || 1;
   const total = data?.total ?? 0;
   const pageSize = data?.size ?? PAGE_SIZE;
-  const items = [...rawItems]
-    .filter((g) => !filters.min_rating || (g.rating ?? 0) >= filters.min_rating)
-    .sort(SORT_FNS[filters.sort] ?? SORT_FNS.fav_count);
+  const filteredItems = rawItems.filter((g) => !filters.min_rating || (g.rating ?? 0) >= filters.min_rating);
+  const items = [...filteredItems].sort(SORT_FNS[filters.sort] ?? SORT_FNS.fav_count);
   const tagSuggestions = useMemo(() => {
     const freq = new Map();
     for (const gallery of items) {
@@ -256,8 +267,8 @@ const GalleryPage = () => {
             <button
               onClick={() => setShowTranslation((v) => !v)}
               className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${showTranslation
-                  ? 'text-sky-400 border-sky-500/40 bg-sky-500/10 hover:bg-sky-500/20'
-                  : 'text-gray-400 border-white/10 hover:text-white hover:bg-white/10'
+                ? 'text-sky-400 border-sky-500/40 bg-sky-500/10 hover:bg-sky-500/20'
+                : 'text-gray-400 border-white/10 hover:text-white hover:bg-white/10'
                 }`}
               title="切换标签中文翻译"
             >
@@ -295,6 +306,12 @@ const GalleryPage = () => {
       {isLoading ? (
         <div className="flex justify-center items-center py-24">
           <Loader2 size={28} className="animate-spin text-gray-600" />
+        </div>
+      ) : !isLoading && !isError && items.length === 0 && recommendedOnly ? (
+        <div className="flex flex-col items-center justify-center py-24 text-gray-500">
+          <Sparkles size={36} className="mb-3 text-gray-600" />
+          <p className="text-sm">还没有推荐内容</p>
+          <p className="text-xs text-gray-600 mt-1">请先在 Admin 中创建并启动 Favorites Sync 任务</p>
         </div>
       ) : (
         viewMode === 'grid' ? (

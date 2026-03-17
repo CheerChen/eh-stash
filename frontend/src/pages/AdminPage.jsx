@@ -18,6 +18,8 @@ import {
   deleteTask,
   getTasks,
   getThumbStats,
+  getScoreDistribution,
+  updateThreshold,
   startTask,
   stopTask,
 } from '../api/admin';
@@ -38,8 +40,10 @@ const DEFAULT_INCREMENTAL = {
   scan_window: 10000,
   rating_diff_threshold: 0.5,
 };
+const DEFAULT_FAVORITES = { run_interval_hours: 6 };
 
 function getDefaultConfig(type) {
+  if (type === 'favorites') return { ...DEFAULT_FAVORITES };
   return type === 'full' ? { ...DEFAULT_FULL } : { ...DEFAULT_INCREMENTAL };
 }
 
@@ -50,6 +54,14 @@ function buildPayload(form) {
       type: form.type,
       category: form.category,
       config: { start_gid: form.config.start_gid === '' ? null : Number(form.config.start_gid) },
+    };
+  }
+  if (form.type === 'favorites') {
+    return {
+      name: form.name.trim(),
+      type: 'favorites',
+      category: 'Favorites',
+      config: { run_interval_hours: Number(form.config.run_interval_hours || 6) },
     };
   }
   return {
@@ -74,10 +86,12 @@ function isTransitioning(task) {
 function getDisplayStatus(task) {
   if (task.status === 'stopped' && task.desired_status === 'running') return 'starting';
   if (task.status === 'running' && task.desired_status === 'stopped') return 'stopping';
+  if (task.type === 'favorites' && task.status === 'completed' && task.desired_status === 'running') return 'scheduled';
   return task.status;
 }
 
 function formatTaskCategory(task) {
+  if (task.type === 'favorites') return 'Favorites';
   if (task.type !== 'incremental') return task.category;
   const categories = Array.isArray(task.config?.categories) ? task.config.categories : [];
   if (!categories.length) return `${MIXED_CATEGORY}(0)`;
@@ -92,6 +106,7 @@ const STATUS_CONFIG = {
   stopping: { text: 'text-amber-300', ring: 'ring-amber-500/30', bg: 'bg-amber-500/10' },
   stopped: { text: 'text-gray-400', ring: 'ring-gray-500/30', bg: 'bg-gray-500/10' },
   completed: { text: 'text-emerald-400', ring: 'ring-emerald-500/30', bg: 'bg-emerald-500/10' },
+  scheduled: { text: 'text-cyan-400', ring: 'ring-cyan-500/30', bg: 'bg-cyan-500/10' },
   error: { text: 'text-rose-400', ring: 'ring-rose-500/30', bg: 'bg-rose-500/10' },
 };
 
@@ -214,6 +229,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
     name: '', type: 'full', category: 'Cosplay', config: getDefaultConfig('full'),
   });
   const hasIncrementalTask = (tasks || []).some((task) => task.type === 'incremental');
+  const hasFavoritesTask = (tasks || []).some((task) => task.type === 'favorites');
 
   const handleTypeChange = (nextType) => {
     setForm((prev) => ({
@@ -221,7 +237,9 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
       type: nextType,
       category: nextType === 'full'
         ? (CATEGORY_OPTIONS.includes(prev.category) ? prev.category : 'Cosplay')
-        : MIXED_CATEGORY,
+        : nextType === 'favorites'
+          ? 'Favorites'
+          : MIXED_CATEGORY,
       config: getDefaultConfig(nextType),
     }));
   };
@@ -242,6 +260,10 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
     if (!form.name.trim()) { setErrorMsg('名称不能为空'); return; }
     if (form.type === 'incremental' && hasIncrementalTask) {
       setErrorMsg('仅允许创建一个 incremental 任务');
+      return;
+    }
+    if (form.type === 'favorites' && hasFavoritesTask) {
+      setErrorMsg('仅允许创建一个 favorites 任务');
       return;
     }
     if (form.type === 'incremental' && (!Array.isArray(form.config.categories) || form.config.categories.length === 0)) {
@@ -293,7 +315,11 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
             label="类型"
             value={form.type}
             onChange={(e) => handleTypeChange(e.target.value)}
-            options={[{ label: 'Full Scan', value: 'full' }, { label: 'Incremental', value: 'incremental' }]}
+            options={[
+              { label: 'Full Scan', value: 'full' },
+              { label: 'Incremental', value: 'incremental' },
+              { label: 'Favorites Sync', value: 'favorites' },
+            ]}
           />
           {form.type === 'full' ? (
             <SelectField
@@ -302,7 +328,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
               onChange={(e) => setForm((p) => ({ ...p, category: e.target.value }))}
               options={CATEGORY_OPTIONS}
             />
-          ) : (
+          ) : form.type === 'incremental' ? (
             <div>
               <label className="block text-xs font-medium text-gray-400 mb-1.5">分类 (categories)</label>
               <div className="rounded-lg border border-white/10 bg-white/5 p-2.5 space-y-1.5 max-h-44 overflow-y-auto">
@@ -323,7 +349,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
               </div>
               <p className="mt-1.5 text-xs text-gray-500">Incremental 使用 Mixed 模式，按上传活跃度抓取。</p>
             </div>
-          )}
+          ) : null /* favorites: no category selector */}
 
           {/* Config fields */}
           <div className="rounded-xl border border-white/10 bg-white/3 p-4 space-y-3">
@@ -335,6 +361,14 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
                 value={form.config.start_gid}
                 onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, start_gid: e.target.value } }))}
                 placeholder="留空从最新开始"
+              />
+            ) : form.type === 'favorites' ? (
+              <InputField
+                label="run_interval_hours (同步间隔/小时)"
+                type="number"
+                step="1"
+                value={form.config.run_interval_hours}
+                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, run_interval_hours: e.target.value } }))}
               />
             ) : (
               <>
@@ -359,6 +393,11 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
               已存在 incremental 任务。系统仅允许一个 incremental 任务。
             </div>
           )}
+          {form.type === 'favorites' && hasFavoritesTask && (
+            <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-sm text-amber-300">
+              已存在 favorites 任务。系统仅允许一个 favorites 任务。
+            </div>
+          )}
 
           {errorMsg && (
             <div className="rounded-lg bg-rose-500/10 border border-rose-500/30 px-3 py-2 text-sm text-rose-400">
@@ -377,7 +416,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
           </button>
           <button
             onClick={handleSubmit}
-            disabled={busy || (form.type === 'incremental' && hasIncrementalTask)}
+            disabled={busy || (form.type === 'incremental' && hasIncrementalTask) || (form.type === 'favorites' && hasFavoritesTask)}
             className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-all disabled:opacity-50 flex items-center gap-2"
           >
             {busy && <Loader2 size={14} className="animate-spin" />}
@@ -442,6 +481,163 @@ function DeleteTaskModal({ open, task, busy, onClose, onConfirm }) {
             删除
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Score Distribution Panel ─────────────────────────────────────────────────
+
+function ScoreDistributionPanel() {
+  const queryClient = useQueryClient();
+  const { data, isLoading } = useQuery({
+    queryKey: ['admin', 'scoreDistribution'],
+    queryFn: getScoreDistribution,
+  });
+
+  const [localThreshold, setLocalThreshold] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const dist = data || { buckets: [], total: 0, threshold: 20, count_above: 0 };
+  const threshold = localThreshold ?? dist.threshold;
+
+  // Reset local when server data arrives
+  useEffect(() => {
+    if (data) setLocalThreshold(null);
+  }, [data?.threshold]);
+
+  const maxCount = Math.max(...dist.buckets.map((b) => b.count), 1);
+
+  // Compute count_above for the local threshold
+  const countAbove = dist.buckets.reduce((sum, b) => {
+    if (b.max > threshold) return sum + b.count;
+    if (b.min <= threshold && b.max > threshold) return sum + Math.round(b.count * (b.max - threshold) / (b.max - b.min));
+    return sum;
+  }, 0);
+  // Use server count_above when unchanged, local estimate when dragging
+  const displayCount = localThreshold == null ? dist.count_above : countAbove;
+
+  const handleSave = async () => {
+    if (localThreshold == null) return;
+    setSaving(true);
+    try {
+      await updateThreshold(localThreshold);
+      queryClient.invalidateQueries({ queryKey: ['admin', 'scoreDistribution'] });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="rounded-xl border border-white/10 bg-white/5 p-6 flex justify-center">
+        <Loader2 size={20} className="animate-spin text-gray-500" />
+      </div>
+    );
+  }
+
+  if (!dist.buckets.length) {
+    return (
+      <div className="rounded-xl border border-white/10 bg-white/5 p-6 text-center text-gray-500 text-sm">
+        暂无推荐数据，请先运行 Favorites Sync 并等待评分完成
+      </div>
+    );
+  }
+
+  const scoreMin = dist.buckets[0]?.min ?? 0;
+  const scoreMax = dist.buckets[dist.buckets.length - 1]?.max ?? 100;
+
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-5 shadow-sm space-y-4">
+      {/* Stats row */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="flex items-center gap-4 text-sm">
+          <span className="text-gray-400">
+            推荐总数: <span className="text-white font-semibold">{dist.total.toLocaleString()}</span>
+          </span>
+          <span className="text-gray-400">
+            阈值 ≥ {threshold}: <span className="text-blue-400 font-semibold">{displayCount.toLocaleString()}</span>
+          </span>
+        </div>
+        {localThreshold != null && localThreshold !== dist.threshold && (
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-all disabled:opacity-50 flex items-center gap-1.5"
+          >
+            {saving && <Loader2 size={12} className="animate-spin" />}
+            保存阈值 {localThreshold}
+          </button>
+        )}
+      </div>
+
+      {/* Histogram */}
+      <div className="relative">
+        <div className="flex items-end gap-px h-32">
+          {dist.buckets.map((b, i) => {
+            const pct = b.count > 0 ? Math.log(b.count + 1) / Math.log(maxCount + 1) : 0;
+            const aboveThreshold = b.min >= threshold;
+            const partial = b.min < threshold && b.max > threshold;
+            return (
+              <div
+                key={i}
+                className="flex-1 relative group"
+                style={{ height: '100%', display: 'flex', alignItems: 'flex-end' }}
+              >
+                <div
+                  className={`w-full rounded-t-sm transition-colors ${aboveThreshold ? 'bg-blue-500/70' : partial ? 'bg-blue-500/40' : 'bg-white/15'
+                    }`}
+                  style={{ height: `${Math.max(pct * 100, 0.5)}%` }}
+                />
+                {/* Tooltip */}
+                <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 hidden group-hover:block z-10
+                                px-2 py-1 rounded bg-zinc-800 border border-white/10 text-[10px] text-gray-300 whitespace-nowrap shadow-lg">
+                  {b.min.toFixed(1)} – {b.max.toFixed(1)}: {b.count}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {/* Threshold line */}
+        {scoreMax > scoreMin && (
+          <div
+            className="absolute top-0 bottom-0 w-px bg-red-500/80 pointer-events-none"
+            style={{ left: `${((threshold - scoreMin) / (scoreMax - scoreMin)) * 100}%` }}
+          >
+            <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-[10px] text-red-400 font-mono whitespace-nowrap">
+              {threshold}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* X-axis labels */}
+      <div className="flex justify-between text-[10px] text-gray-500 font-mono -mt-1">
+        <span>{scoreMin.toFixed(0)}</span>
+        <span>{scoreMax.toFixed(0)}</span>
+      </div>
+
+      {/* Slider */}
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-gray-400 shrink-0">阈值</span>
+        <input
+          type="range"
+          min={scoreMin}
+          max={scoreMax}
+          step={0.5}
+          value={threshold}
+          onChange={(e) => setLocalThreshold(Number(e.target.value))}
+          className="flex-1 h-1.5 accent-blue-500 cursor-pointer"
+        />
+        <input
+          type="number"
+          min={0}
+          step={0.5}
+          value={threshold}
+          onChange={(e) => setLocalThreshold(Number(e.target.value))}
+          className="w-20 px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-white text-xs text-center
+                     focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
+        />
       </div>
     </div>
   );
@@ -611,6 +807,12 @@ export default function AdminPage() {
         </div>
       </div>
 
+      {/* Recommended Score Distribution */}
+      <div>
+        <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Recommended Score Distribution</p>
+        <ScoreDistributionPanel />
+      </div>
+
       {/* Sync Tasks Table */}
       <div>
         <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Sync Tasks</p>
@@ -639,20 +841,27 @@ export default function AdminPage() {
                 {tasks.map((task) => {
                   const progress = Number(task.progress_pct || 0);
                   const isIncremental = task.type === 'incremental';
+                  const isFavorites = task.type === 'favorites';
                   const dbCount = isIncremental
                     ? (task.state?.scanned_count ?? null)
-                    : (task.state?.db_count ?? null);
+                    : isFavorites
+                      ? null
+                      : (task.state?.db_count ?? null);
                   const totalCount = isIncremental
                     ? (task.config?.scan_window ?? null)
-                    : (task.state?.total_count ?? null);
+                    : isFavorites
+                      ? null
+                      : (task.state?.total_count ?? null);
                   const transition = isTransitioning(task);
                   const displayStatus = getDisplayStatus(task);
                   const rowAction = pendingByTask[task.id];
                   const rowBusy = Boolean(rowAction);
 
-                  const canStart = !rowBusy && !transition && task.status !== 'running' && task.status !== 'completed';
+                  const canStart = !rowBusy && !transition && task.status !== 'running'
+                    && (task.status !== 'completed' || task.type === 'favorites');
                   const canStop = !rowBusy && !transition && task.status === 'running';
-                  const canDelete = !rowBusy && !transition && task.status !== 'running' && task.desired_status !== 'running';
+                  const canDelete = !rowBusy && !transition && task.status !== 'running'
+                    && (task.desired_status !== 'running' || (task.type === 'favorites' && task.status === 'completed'));
 
                   return (
                     <tr
