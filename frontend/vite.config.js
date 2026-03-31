@@ -14,12 +14,12 @@ export default defineConfig({
     },
     proxy: {
       '/api': {
-        target: 'http://api:3000',
+        target: 'http://192.168.0.110:3000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/v1': {
-        target: 'http://api:3000',
+        target: 'http://192.168.0.110:3000',
         changeOrigin: true,
       },
     }
@@ -30,12 +30,12 @@ export default defineConfig({
     port: 4173,
     proxy: {
       '/api': {
-        target: 'http://api:3000',
+        target: 'http://192.168.0.110:3000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/v1': {
-        target: 'http://api:3000',
+        target: 'http://192.168.0.110:3000',
         changeOrigin: true,
       },
     }

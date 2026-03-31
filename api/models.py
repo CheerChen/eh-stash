@@ -29,6 +29,8 @@ class Gallery(BaseModel):
     is_favorited: bool = False
     favorited_at: Optional[datetime] = None
     rec_score: Optional[float] = None
+    group_id: Optional[int] = None
+    group_count: Optional[int] = None
 
 class GalleryList(BaseModel):
     items: List[Gallery]

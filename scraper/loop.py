@@ -123,6 +123,7 @@ class SimpleRateLimiter:
 _rate_limiter: GlobalRateLimiter | None = None
 _thumb_rate_limiter: SimpleRateLimiter | None = None
 _scorer_reset: asyncio.Event | None = None
+_grouper_trigger: asyncio.Event | None = None
 
 DEFAULT_FULL_CONFIG = {
     "inline_set": "dm_e",
@@ -435,7 +436,7 @@ def should_refresh_from_list(
     return bool(reasons), reasons
 
 
-def build_upsert_row(gid: int, token: str, detail: dict):
+def build_upsert_row(gid: int, token: str, detail: dict, is_active: bool = True):
     return (
         gid,
         token,
@@ -451,6 +452,7 @@ def build_upsert_row(gid: int, token: str, detail: dict):
         detail.get("comment_count", 0),
         detail.get("thumb"),
         Json(detail.get("tags", {})),
+        is_active,
     )
 
 
@@ -515,7 +517,10 @@ async def run_full_once(client: AsyncSession, task_id: int, runtime: dict) -> bo
     )
 
     rows_to_upsert = []
+    n_deleted = 0
     for item in items:
+        if item.is_deleted:
+            n_deleted += 1
         detail = await fetch_detail(client, item.gid, item.token, task_name=runtime["name"])
         if detail == "BANNED":
             ban_msg = "IP temporarily banned by ExHentai, will retry when ban expires"
@@ -530,12 +535,18 @@ async def run_full_once(client: AsyncSession, task_id: int, runtime: dict) -> bo
             )
             return False
         if detail:
-            rows_to_upsert.append(build_upsert_row(item.gid, item.token, detail))
+            rows_to_upsert.append(build_upsert_row(item.gid, item.token, detail, is_active=not item.is_deleted))
         else:
             logger.warning(f"[FULL ] [{_name}] gid={item.gid} detail fetch failed, skipping")
 
+    logger.info(
+        f"[FULL ] [{_name}] page_items={len(items)} upsert={len(rows_to_upsert)} deleted={n_deleted}"
+    )
+
     if rows_to_upsert:
         db.upsert_galleries_bulk(rows_to_upsert)
+        if _grouper_trigger:
+            _grouper_trigger.set()
 
     done = (not items) or (next_cursor is None)
     round_num = int(state.get("round") or 0)
@@ -660,8 +671,10 @@ async def run_incremental_once(client: AsyncSession, task_id: int, runtime: dict
         )
 
         rows_to_upsert = []
-        n_new = n_skip = n_refresh = 0
+        n_new = n_skip = n_refresh = n_deleted = 0
         for item in items:
+            if item.is_deleted:
+                n_deleted += 1
             existing = get_gallery_meta(item.gid)
             if existing is None:
                 n_new += 1
@@ -671,7 +684,13 @@ async def run_incremental_once(client: AsyncSession, task_id: int, runtime: dict
                     exit_reason = "BANNED"
                     break
                 if detail:
-                    rows_to_upsert.append(build_upsert_row(item.gid, item.token, detail))
+                    rows_to_upsert.append(build_upsert_row(item.gid, item.token, detail, is_active=not item.is_deleted))
+                continue
+
+            # 已存在但列表页标记为已删除 → 直接更新 is_active，无需 fetch detail
+            if item.is_deleted:
+                db.mark_gallery_inactive(item.gid)
+                n_skip += 1
                 continue
 
             should_fetch, reasons = should_refresh_from_list(existing, item, rating_threshold)
@@ -686,7 +705,7 @@ async def run_incremental_once(client: AsyncSession, task_id: int, runtime: dict
                 exit_reason = "BANNED"
                 break
             if detail:
-                rows_to_upsert.append(build_upsert_row(item.gid, item.token, detail))
+                rows_to_upsert.append(build_upsert_row(item.gid, item.token, detail, is_active=not item.is_deleted))
 
         # 所有 items 计入已扫描（含 skip/new/refresh）
         scanned_count += len(items)
@@ -694,10 +713,13 @@ async def run_incremental_once(client: AsyncSession, task_id: int, runtime: dict
         logger.info(
             f"[INCR ] [{_name}] page_items={len(items)}"
             f" new={n_new} skip={n_skip} refresh={n_refresh}"
+            f" deleted={n_deleted}"
         )
 
         if rows_to_upsert:
             db.upsert_galleries_bulk(rows_to_upsert)
+            if _grouper_trigger:
+                _grouper_trigger.set()
 
         if exit_reason == "BANNED":
             break
@@ -862,9 +884,9 @@ async def run_favorites_once(client: AsyncSession, task_id: int, runtime: dict) 
         logger.info(f"[FAV  ] [{_name}] page {page_num}: items={len(items)} next_gid={next_cursor}")
 
         # ── Backfill missing galleries ──
+        item_map = {item.gid: item for item in items}
         missing_gids = [g for g in db.get_non_existing_gids(page_gids) if g not in failed_gids]
         if missing_gids:
-            item_map = {item.gid: item for item in items}
             logger.info(f"[FAV  ] [{_name}] {len(missing_gids)} galleries need detail fetch")
             rows_to_upsert = []
             for gid in missing_gids:
@@ -887,6 +909,19 @@ async def run_favorites_once(client: AsyncSession, task_id: int, runtime: dict) 
             if rows_to_upsert:
                 db.upsert_galleries_bulk(rows_to_upsert)
                 logger.info(f"[FAV  ] [{_name}] backfilled {len(rows_to_upsert)} galleries")
+                if _grouper_trigger:
+                    _grouper_trigger.set()
+
+        # ── Mark deleted galleries inactive ──
+        existing_gids = set(page_gids) - set(missing_gids) - failed_gids
+        n_deleted = 0
+        for gid in existing_gids:
+            item = item_map.get(gid)
+            if item and item.is_deleted:
+                db.mark_gallery_inactive(gid)
+                n_deleted += 1
+        if n_deleted:
+            logger.info(f"[FAV  ] [{_name}] marked {n_deleted} existing galleries inactive")
 
         # ── Upsert favorites (per-page) ──
         fav_pairs = [(item.gid, item.favorited_at) for item in items]
@@ -1113,16 +1148,62 @@ async def run_recommended_scorer():
             await asyncio.sleep(10)
 
 
+GROUPER_IDLE_INTERVAL = 60
+
+
+async def run_gallery_grouper():
+    """Background coroutine that maintains gallery_group_members.
+    On first run: full rebuild if table is empty, otherwise incremental.
+    After that: waits for _grouper_trigger signal to run incremental.
+    """
+    global _grouper_trigger
+    logger.info("[GROUP] gallery grouper started")
+
+    # Initial run
+    try:
+        if db.gallery_group_is_empty():
+            count = db.gallery_group_full_rebuild()
+            logger.info(f"[GROUP] full rebuild complete: {count} rows")
+        else:
+            count = db.gallery_group_incremental()
+            logger.info(f"[GROUP] startup incremental: {count} rows updated")
+    except Exception as e:
+        logger.error(f"[GROUP] initial run error: {e}")
+
+    while True:
+        try:
+            if _grouper_trigger:
+                try:
+                    await asyncio.wait_for(_grouper_trigger.wait(), timeout=GROUPER_IDLE_INTERVAL)
+                    _grouper_trigger.clear()
+                except asyncio.TimeoutError:
+                    continue
+            else:
+                await asyncio.sleep(GROUPER_IDLE_INTERVAL)
+                continue
+
+            count = db.gallery_group_incremental()
+            if count:
+                logger.info(f"[GROUP] incremental: {count} rows updated")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[GROUP] error: {e}")
+            await asyncio.sleep(10)
+
+
 async def run_loop():
     logger.info("Starting DB-driven sync scheduler...")
 
     if any("YOUR_" in v for v in config.COOKIES.values()):
         logger.warning("Default cookies detected in .env, update EX_COOKIES.")
 
-    global _rate_limiter, _thumb_rate_limiter, _scorer_reset
+    global _rate_limiter, _thumb_rate_limiter, _scorer_reset, _grouper_trigger
     _rate_limiter = GlobalRateLimiter(config.RATE_INTERVAL)
     _thumb_rate_limiter = SimpleRateLimiter(config.THUMB_RATE_INTERVAL)
     _scorer_reset = asyncio.Event()
+    _grouper_trigger = asyncio.Event()
     logger.info(f"Global rate limiter: main={config.RATE_INTERVAL}s/req  thumb={config.THUMB_RATE_INTERVAL}s/req")
     if config.PROXY_URL:
         logger.info(f"Proxy enabled: {config.PROXY_URL}")
@@ -1146,6 +1227,7 @@ async def run_loop():
 
         thumb_task = asyncio.create_task(run_thumb_worker(), name="thumb-worker")
         scorer_task = asyncio.create_task(run_recommended_scorer(), name="recommended-scorer")
+        grouper_task = asyncio.create_task(run_gallery_grouper(), name="gallery-grouper")
 
         logger.info(f"[SCHED] warmup: waiting {WARMUP_DELAY}s before starting task scheduler...")
         await asyncio.sleep(WARMUP_DELAY)
@@ -1200,6 +1282,7 @@ async def run_loop():
 
                 await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
         finally:
+            grouper_task.cancel()
             scorer_task.cancel()
             thumb_task.cancel()
             for task_obj in running_tasks.values():

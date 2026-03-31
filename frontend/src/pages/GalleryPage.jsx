@@ -4,6 +4,7 @@ import { LayoutGrid, LayoutList, ChevronFirst, ChevronLast, ChevronLeft, Chevron
 import { fetchGalleries } from '../api';
 import GalleryCard from '../components/GalleryCard';
 import FilterPanel from '../components/FilterPanel';
+import GroupModal from '../components/GroupModal';
 import { useTagTranslation } from '../hooks/useTagTranslation';
 
 const PAGE_SIZE = 100;
@@ -167,6 +168,7 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
   });
   const [viewMode, setViewMode] = useState(getInitialViewMode);
   const [showTranslation, setShowTranslation] = useState(false);
+  const [groupModalId, setGroupModalId] = useState(null);
   const { translate } = useTagTranslation(showTranslation);
 
   const apiSort = recommendedOnly ? 'recommended' : 'gid_desc';
@@ -217,7 +219,18 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
   const total = data?.total ?? 0;
   const pageSize = data?.size ?? PAGE_SIZE;
   const filteredItems = rawItems.filter((g) => !filters.min_rating || (g.rating ?? 0) >= filters.min_rating);
-  const items = [...filteredItems].sort(SORT_FNS[filters.sort] ?? SORT_FNS.fav_count);
+  const sortedItems = [...filteredItems].sort(SORT_FNS[filters.sort] ?? SORT_FNS.fav_count);
+
+  // Aggregate same-group galleries: keep first occurrence per group_id
+  const items = useMemo(() => {
+    const seen = new Set();
+    return sortedItems.filter((g) => {
+      if (!g.group_id) return true;
+      if (seen.has(g.group_id)) return false;
+      seen.add(g.group_id);
+      return true;
+    });
+  }, [sortedItems]);
   const tagSuggestions = useMemo(() => {
     const freq = new Map();
     for (const gallery of items) {
@@ -317,19 +330,23 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
         viewMode === 'grid' ? (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-6 gap-3">
             {items.map((gallery) => (
-              <GalleryCard key={gallery.gid} gallery={gallery} viewMode="grid" />
+              <GalleryCard key={gallery.gid} gallery={gallery} viewMode="grid" onGroupClick={setGroupModalId} />
             ))}
           </div>
         ) : (
           <div className="flex flex-col gap-2">
             {items.map((gallery) => (
-              <GalleryCard key={gallery.gid} gallery={gallery} viewMode="list" onTagSearch={handleTagSearch} translate={showTranslation ? translate : undefined} />
+              <GalleryCard key={gallery.gid} gallery={gallery} viewMode="list" onTagSearch={handleTagSearch} translate={showTranslation ? translate : undefined} onGroupClick={setGroupModalId} />
             ))}
           </div>
         )
       )}
 
       <PaginationBar page={page} totalPages={totalPages || 1} onPageChange={handlePageChange} />
+
+      {groupModalId && (
+        <GroupModal groupId={groupModalId} onClose={() => setGroupModalId(null)} />
+      )}
     </div>
   );
 };
