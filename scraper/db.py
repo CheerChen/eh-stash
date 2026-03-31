@@ -61,11 +61,11 @@ def upsert_galleries_bulk(rows: list[tuple]) -> int:
             thumb = EXCLUDED.thumb,
             tags = EXCLUDED.tags,
             last_synced_at = NOW(),
-            is_active = TRUE
+            is_active = EXCLUDED.is_active
     """
     template = """
         (%s, %s, %s, %s, %s, %s, %s, %s,
-         %s, %s, %s, %s, %s, %s, NOW(), TRUE)
+         %s, %s, %s, %s, %s, %s, NOW(), %s)
     """
 
     thumb_rows = [(row[0], row[12]) for row in rows if row[12]]
@@ -254,6 +254,11 @@ def mark_thumb_queue_permanent_failed(item_id: int) -> None:
             """,
             (item_id,),
         )
+
+
+def mark_gallery_inactive(gid: int) -> None:
+    with get_cursor() as (cur, _):
+        cur.execute("UPDATE eh_galleries SET is_active = FALSE WHERE gid = %s", (gid,))
 
 
 def reset_stale_thumb_processing() -> int:
@@ -448,3 +453,76 @@ def score_recommended_batch(cursor_gid: int | None, batch_size: int = 100) -> tu
 
         next_cursor = gids[-1] if len(gids) == batch_size else None
         return gids, next_cursor
+
+
+# ── Gallery Grouping ─────────────────────────────────────────────────────────
+
+_BASE_TITLE_EXPR = "REGEXP_REPLACE(REGEXP_REPLACE(title_jpn, '\\s*\\[中国翻訳\\]', '', 'g'), '\\s+', '', 'g')"
+
+
+def gallery_group_full_rebuild() -> int:
+    """全量重建 gallery_group_members，返回写入行数。"""
+    with get_cursor() as (cur, _):
+        cur.execute("TRUNCATE gallery_group_members")
+        cur.execute(
+            f"""
+            WITH base AS (
+                SELECT gid, {_BASE_TITLE_EXPR} AS base_title
+                FROM eh_galleries
+                WHERE title_jpn IS NOT NULL AND title_jpn != ''
+            ),
+            multi AS (
+                SELECT base_title FROM base
+                GROUP BY base_title HAVING COUNT(*) > 1
+            ),
+            grouped AS (
+                SELECT MIN(b.gid) OVER (PARTITION BY b.base_title) AS group_id, b.gid
+                FROM base b
+                JOIN multi m ON b.base_title = m.base_title
+            )
+            INSERT INTO gallery_group_members (group_id, gid)
+            SELECT group_id, gid FROM grouped
+            ON CONFLICT (gid) DO UPDATE SET group_id = EXCLUDED.group_id
+            """
+        )
+        return cur.rowcount
+
+
+def gallery_group_incremental() -> int:
+    """增量分组：只处理不在 gallery_group_members 中的新画廊，返回新增/更新行数。"""
+    with get_cursor() as (cur, _):
+        cur.execute(
+            f"""
+            WITH new_galleries AS (
+                SELECT gid, {_BASE_TITLE_EXPR} AS base_title
+                FROM eh_galleries
+                WHERE title_jpn IS NOT NULL AND title_jpn != ''
+                  AND gid NOT IN (SELECT gid FROM gallery_group_members)
+            ),
+            matching AS (
+                SELECT gid, {_BASE_TITLE_EXPR} AS base_title
+                FROM eh_galleries
+                WHERE title_jpn IS NOT NULL AND title_jpn != ''
+                  AND {_BASE_TITLE_EXPR} IN (SELECT base_title FROM new_galleries)
+            ),
+            multi AS (
+                SELECT base_title FROM matching
+                GROUP BY base_title HAVING COUNT(*) > 1
+            ),
+            grouped AS (
+                SELECT MIN(m.gid) OVER (PARTITION BY m.base_title) AS group_id, m.gid
+                FROM matching m
+                JOIN multi mu ON m.base_title = mu.base_title
+            )
+            INSERT INTO gallery_group_members (group_id, gid)
+            SELECT group_id, gid FROM grouped
+            ON CONFLICT (gid) DO UPDATE SET group_id = EXCLUDED.group_id
+            """
+        )
+        return cur.rowcount
+
+
+def gallery_group_is_empty() -> bool:
+    with get_cursor() as (cur, _):
+        cur.execute("SELECT 1 FROM gallery_group_members LIMIT 1")
+        return cur.fetchone() is None

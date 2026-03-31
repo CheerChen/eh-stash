@@ -1,5 +1,5 @@
 import React from 'react';
-import { Star, Heart, MessageCircle, ExternalLink, FileText, Globe, User, Calendar } from 'lucide-react';
+import { Star, Heart, MessageCircle, ExternalLink, FileText, Globe, User, Calendar, Layers } from 'lucide-react';
 import TagBadge from './TagBadge';
 
 const isAndroid = /Android/i.test(navigator.userAgent);
@@ -32,21 +32,30 @@ const NS_ORDER = ['artist', 'group', 'parody', 'character', 'female', 'male', 'l
 
 // ─── Grid Card ────────────────────────────────────────────────────────────────
 
-function GridCard({ gallery }) {
+function GridCard({ gallery, onGroupClick }) {
   const { gid, token, title, title_jpn, category, rating, fav_count, thumb, posted_at } = gallery;
   const displayTitle = title_jpn || title;
   const exUrl = getExUrl(gid, token);
   const catStyle = CATEGORY_STYLES[category] || CATEGORY_STYLES['Misc'];
+  const hasGroup = gallery.group_count > 1;
   const date = posted_at
     ? new Date(posted_at).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
     : null;
+
+  const handleClick = (e) => {
+    if (hasGroup) {
+      e.preventDefault();
+      onGroupClick?.(gallery.group_id);
+    }
+  };
 
   return (
     <a
       href={exUrl}
       target={isAndroid ? '_self' : '_blank'}
       rel="noopener noreferrer"
-      className="group flex flex-col rounded-lg overflow-hidden bg-zinc-900 ring-1 ring-white/5 hover:ring-amber-400/60 transition-all duration-150"
+      onClick={handleClick}
+      className={`group flex flex-col rounded-lg overflow-hidden bg-zinc-900 transition-all duration-150 ${gallery.is_favorited ? 'ring-2 ring-rose-500/70 hover:ring-rose-400' : 'ring-1 ring-white/5 hover:ring-amber-400/60'}`}
       title={displayTitle}
     >
       {/* Cover */}
@@ -58,14 +67,33 @@ function GridCard({ gallery }) {
           className="absolute inset-0 w-full h-full object-contain bg-zinc-950"
           loading="lazy"
         />
-        {/* Category badge */}
-        <span className={`absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold text-white ${catStyle}`}>
-          {category}
-        </span>
-        {/* Favorites badge */}
+        {/* Category + custom badges */}
+        <div className="absolute top-1.5 right-1.5 flex flex-col items-end gap-0.5">
+          <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold text-white ${catStyle}`}>
+            {category}
+          </span>
+          {!gallery.is_active && (
+            <span className="px-1.5 py-0.5 rounded text-[10px] font-bold text-white bg-red-700/80">
+              Deleted
+            </span>
+          )}
+          {category === 'Doujinshi' && gallery.pages > 0 && gallery.pages < 10 && (
+            <span className="px-1.5 py-0.5 rounded text-[10px] font-bold text-white bg-zinc-500/80">
+              おまけ
+            </span>
+          )}
+        </div>
+        {/* Favorites badge — corner ribbon */}
         {gallery.is_favorited && (
-          <span className="absolute top-1.5 left-1.5">
-            <Heart size={12} className="fill-rose-400 text-rose-400 drop-shadow" />
+          <>
+            <div className="absolute top-0 left-0 w-0 h-0 border-t-[36px] border-r-[36px] border-t-rose-500/80 border-r-transparent" />
+            <Heart size={12} className="absolute top-1 left-1 fill-white text-white drop-shadow" />
+          </>
+        )}
+        {/* Version count badge */}
+        {hasGroup && (
+          <span className="absolute bottom-1.5 left-1.5 flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-amber-500/80 text-[10px] font-bold text-white">
+            <Layers size={10} />{gallery.group_count}
           </span>
         )}
       </div>
@@ -95,7 +123,7 @@ function GridCard({ gallery }) {
 
 // ─── List Row ─────────────────────────────────────────────────────────────────
 
-function ListRow({ gallery, onTagSearch, translate }) {
+function ListRow({ gallery, onTagSearch, translate, onGroupClick }) {
   const { gid, token, title, title_jpn, category, rating, fav_count, comment_count,
     thumb, posted_at, uploader, pages, language, tags } = gallery;
   const displayTitle = title_jpn || title;
@@ -190,6 +218,15 @@ function ListRow({ gallery, onTagSearch, translate }) {
               <Calendar size={10} />{date}
             </span>
           )}
+          {gallery.group_count > 1 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onGroupClick?.(gallery.group_id); }}
+              className="flex items-center gap-0.5 text-amber-400 hover:text-amber-300 cursor-pointer"
+              title={`${gallery.group_count} 个版本`}
+            >
+              <Layers size={10} />{gallery.group_count}版本
+            </button>
+          )}
         </div>
 
         {/* Tags – grouped by namespace */}
@@ -225,11 +262,11 @@ function ListRow({ gallery, onTagSearch, translate }) {
 
 // ─── Export ───────────────────────────────────────────────────────────────────
 
-const GalleryCard = ({ gallery, viewMode = 'grid', onTagSearch, translate }) => {
+const GalleryCard = ({ gallery, viewMode = 'grid', onTagSearch, translate, onGroupClick }) => {
   if (viewMode === 'list') {
-    return <ListRow gallery={gallery} onTagSearch={onTagSearch} translate={translate} />;
+    return <ListRow gallery={gallery} onTagSearch={onTagSearch} translate={translate} onGroupClick={onGroupClick} />;
   }
-  return <GridCard gallery={gallery} />;
+  return <GridCard gallery={gallery} onGroupClick={onGroupClick} />;
 };
 
 export default GalleryCard;

@@ -39,7 +39,7 @@ TAG_BLACKLIST: list[list[tuple[str, str]]] = _parse_blacklist()
 
 def _build_where(category, language, min_rating, min_fav, tag):
     """Build shared WHERE clauses and params for gallery queries."""
-    parts = ["g.is_active = TRUE"]
+    parts = ["TRUE"]
     params = []
 
     for rule in TAG_BLACKLIST:
@@ -88,17 +88,27 @@ def _get_recommended(*, db, category, language, min_rating, min_fav, tag, is_fav
     params.append(_admin_mod._recommend_threshold)
 
     if is_favorited is True:
-        where_parts.append("f.gid IS NOT NULL")
+        where_parts.append("(f.gid IS NOT NULL OR gf.group_id IS NOT NULL)")
     elif is_favorited is False:
-        where_parts.append("f.gid IS NULL")
+        where_parts.append("(f.gid IS NULL AND gf.group_id IS NULL)")
 
     where_sql = " AND ".join(where_parts)
 
     query = f"""
-        SELECT g.*, c.rec_score, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at
+        SELECT g.*, c.rec_score,
+               (f.gid IS NOT NULL OR gf.group_id IS NOT NULL) AS is_favorited,
+               f.favorited_at,
+               ggm.group_id,
+               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
         FROM recommended_cache c
         JOIN eh_galleries g ON g.gid = c.gid
         LEFT JOIN user_favorites f ON g.gid = f.gid
+        LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
+        LEFT JOIN (
+            SELECT DISTINCT ggm2.group_id
+            FROM gallery_group_members ggm2
+            JOIN user_favorites f2 ON f2.gid = ggm2.gid
+        ) gf ON gf.group_id = ggm.group_id
         WHERE {where_sql}
         ORDER BY g.gid DESC
     """
@@ -147,14 +157,24 @@ def get_galleries(
     if is_favorited is True:
         where_parts.append("f.gid IS NOT NULL")
     elif is_favorited is False:
-        where_parts.append("f.gid IS NULL")
+        where_parts.append("(f.gid IS NULL AND gf.group_id IS NULL)")
 
     where_sql = " AND ".join(where_parts)
 
     query = f"""
-        SELECT g.*, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at
+        SELECT g.*,
+               (f.gid IS NOT NULL OR gf.group_id IS NOT NULL) AS is_favorited,
+               f.favorited_at,
+               ggm.group_id,
+               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
         FROM eh_galleries g
         LEFT JOIN user_favorites f ON g.gid = f.gid
+        LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
+        LEFT JOIN (
+            SELECT DISTINCT ggm2.group_id
+            FROM gallery_group_members ggm2
+            JOIN user_favorites f2 ON f2.gid = ggm2.gid
+        ) gf ON gf.group_id = ggm.group_id
         WHERE {where_sql}
     """
 
@@ -183,13 +203,37 @@ def get_galleries(
 
     return GalleryList(items=items, total=total, page=page, size=page_size, pages=math.ceil(total / page_size) if total else 0)
 
+@router.get("/group/{group_id}", response_model=List[Gallery])
+def get_gallery_group(group_id: int, db = Depends(get_db)):
+    db.execute(
+        """
+        SELECT g.*, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at,
+               ggm.group_id,
+               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
+        FROM gallery_group_members ggm
+        JOIN eh_galleries g ON g.gid = ggm.gid
+        LEFT JOIN user_favorites f ON g.gid = f.gid
+        WHERE ggm.group_id = %s
+        ORDER BY g.posted_at ASC
+        """,
+        (group_id,),
+    )
+    rows = db.fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return _rows_to_galleries(db, rows)
+
+
 @router.get("/{gid}", response_model=Gallery)
 def get_gallery(gid: int, db = Depends(get_db)):
     db.execute(
         """
-        SELECT g.*, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at
+        SELECT g.*, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at,
+               ggm.group_id,
+               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
         FROM eh_galleries g
         LEFT JOIN user_favorites f ON g.gid = f.gid
+        LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
         WHERE g.gid = %s
         """,
         (gid,),

@@ -20,6 +20,7 @@ class GalleryListItem:
     rating_est: float | None
     visible_tags: tuple[str, ...]
     favorited_at: str | None = None
+    is_deleted: bool = False
 
 
 def _normalize_text(value: str) -> str:
@@ -158,6 +159,12 @@ def parse_gallery_list(html: str) -> tuple[list[GalleryListItem], int | None, in
                     fav_at = next_p.get_text(strip=True) or None
                 break
 
+        # Detect deleted galleries: posted date wrapped in <s> tag
+        is_deleted = False
+        posted_div = element.find(id=re.compile(r"^posted_"))
+        if posted_div and posted_div.find("s"):
+            is_deleted = True
+
         results.append(
             GalleryListItem(
                 gid=gid,
@@ -167,6 +174,7 @@ def parse_gallery_list(html: str) -> tuple[list[GalleryListItem], int | None, in
                 rating_est=rating_est,
                 visible_tags=tuple(sorted(visible_tags)),
                 favorited_at=fav_at,
+                is_deleted=is_deleted,
             )
         )
 
