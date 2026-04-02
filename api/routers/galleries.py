@@ -99,11 +99,16 @@ def _get_recommended(*, db, category, language, min_rating, min_fav, tag, is_fav
                (f.gid IS NOT NULL OR gf.group_id IS NOT NULL) AS is_favorited,
                f.favorited_at,
                ggm.group_id,
-               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
+               COALESCE(gc.cnt, 0) AS group_count
         FROM recommended_cache c
         JOIN eh_galleries g ON g.gid = c.gid
         LEFT JOIN user_favorites f ON g.gid = f.gid
         LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
+        LEFT JOIN (
+            SELECT group_id, COUNT(*) AS cnt
+            FROM gallery_group_members
+            GROUP BY group_id
+        ) gc ON gc.group_id = ggm.group_id
         LEFT JOIN (
             SELECT DISTINCT ggm2.group_id
             FROM gallery_group_members ggm2
@@ -166,10 +171,15 @@ def get_galleries(
                (f.gid IS NOT NULL OR gf.group_id IS NOT NULL) AS is_favorited,
                f.favorited_at,
                ggm.group_id,
-               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
+               COALESCE(gc.cnt, 0) AS group_count
         FROM eh_galleries g
         LEFT JOIN user_favorites f ON g.gid = f.gid
         LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
+        LEFT JOIN (
+            SELECT group_id, COUNT(*) AS cnt
+            FROM gallery_group_members
+            GROUP BY group_id
+        ) gc ON gc.group_id = ggm.group_id
         LEFT JOIN (
             SELECT DISTINCT ggm2.group_id
             FROM gallery_group_members ggm2
@@ -209,7 +219,7 @@ def get_gallery_group(group_id: int, db = Depends(get_db)):
         """
         SELECT g.*, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at,
                ggm.group_id,
-               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
+               COUNT(*) OVER (PARTITION BY ggm.group_id) AS group_count
         FROM gallery_group_members ggm
         JOIN eh_galleries g ON g.gid = ggm.gid
         LEFT JOIN user_favorites f ON g.gid = f.gid
@@ -230,10 +240,15 @@ def get_gallery(gid: int, db = Depends(get_db)):
         """
         SELECT g.*, (f.gid IS NOT NULL) AS is_favorited, f.favorited_at,
                ggm.group_id,
-               (SELECT COUNT(*) FROM gallery_group_members ggm2 WHERE ggm2.group_id = ggm.group_id) AS group_count
+               COALESCE(gc.cnt, 0) AS group_count
         FROM eh_galleries g
         LEFT JOIN user_favorites f ON g.gid = f.gid
         LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
+        LEFT JOIN (
+            SELECT group_id, COUNT(*) AS cnt
+            FROM gallery_group_members
+            GROUP BY group_id
+        ) gc ON gc.group_id = ggm.group_id
         WHERE g.gid = %s
         """,
         (gid,),

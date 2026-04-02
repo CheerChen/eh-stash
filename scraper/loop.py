@@ -928,12 +928,6 @@ async def run_favorites_once(client: AsyncSession, task_id: int, runtime: dict) 
         fav_count = db.upsert_favorites(fav_pairs)
         logger.info(f"[FAV  ] [{_name}] upserted {fav_count} favorites")
 
-        # ── Rebuild preference tags (per-page) ──
-        tag_count = db.rebuild_preference_tags()
-        logger.info(f"[FAV  ] [{_name}] rebuilt {tag_count} preference tags")
-        if _scorer_reset:
-            _scorer_reset.set()
-
         collected_gids.extend(page_gids)
 
         # ── Update progress & advance cursor ──
@@ -950,10 +944,13 @@ async def run_favorites_once(client: AsyncSession, task_id: int, runtime: dict) 
         removed = db.cleanup_stale_favorites(collected_gids)
         if removed:
             logger.info(f"[FAV  ] [{_name}] cleanup: removed {removed} stale favorites")
-            tag_count = db.rebuild_preference_tags()
-            logger.info(f"[FAV  ] [{_name}] rebuilt {tag_count} preference tags after cleanup")
-            if _scorer_reset:
-                _scorer_reset.set()
+
+    # Rebuild preference tags once after all pages synced
+    if collected_gids:
+        tag_count = db.rebuild_preference_tags()
+        logger.info(f"[FAV  ] [{_name}] rebuilt {tag_count} preference tags")
+        if _scorer_reset:
+            _scorer_reset.set()
 
     logger.info(f"[FAV  ] [{_name}] completed round={round_num + 1}, total={len(collected_gids)} favorites")
     db.update_task_runtime(
@@ -1096,7 +1093,7 @@ async def run_thumb_worker():
 
 
 SCORER_BATCH_SIZE = 100
-SCORER_BATCH_INTERVAL = 0.1  # seconds between batches (pure DB, no rate limit needed)
+SCORER_BATCH_INTERVAL = 2    # seconds between batches (gentler on Pi CPU)
 SCORER_IDLE_INTERVAL = 30    # seconds to wait when fully scored before rechecking
 
 
@@ -1123,17 +1120,14 @@ async def run_recommended_scorer():
             if not gids:
                 # No more galleries to process or no preference data
                 if cursor is not None:
-                    logger.info("[SCORE] full scan complete, idling")
+                    logger.info("[SCORE] full scan complete, idling until next reset signal")
                     cursor = None
-                # Wait for reset or periodic recheck
+                # Only restart on explicit reset signal (no periodic recheck)
                 if _scorer_reset:
-                    try:
-                        await asyncio.wait_for(_scorer_reset.wait(), timeout=SCORER_IDLE_INTERVAL)
-                        _scorer_reset.clear()
-                        cursor = None
-                        logger.info("[SCORE] reset: restarting from latest gid")
-                    except asyncio.TimeoutError:
-                        pass
+                    await _scorer_reset.wait()
+                    _scorer_reset.clear()
+                    cursor = None
+                    logger.info("[SCORE] reset: restarting from latest gid")
                 else:
                     await asyncio.sleep(SCORER_IDLE_INTERVAL)
                 continue
