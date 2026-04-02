@@ -20,6 +20,17 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c effective_cache_size=128MB
+      -c max_connections=20
 
   scraper:
     image: ${REGISTRY_URL:-192.168.0.110:5000}/eh-stash-scraper:${TAG:-latest}
