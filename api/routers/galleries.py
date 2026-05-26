@@ -108,9 +108,11 @@ def _get_recommended(*, db, category, language, min_rating, min_fav, tag, is_fav
         LEFT JOIN user_favorites f ON g.gid = f.gid
         LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
         LEFT JOIN (
-            SELECT group_id, COUNT(*) AS cnt
-            FROM gallery_group_members
-            GROUP BY group_id
+            SELECT ggmc.group_id, COUNT(*) AS cnt
+            FROM gallery_group_members ggmc
+            JOIN eh_galleries gc2 ON gc2.gid = ggmc.gid
+            WHERE gc2.is_active = TRUE
+            GROUP BY ggmc.group_id
         ) gc ON gc.group_id = ggm.group_id
         LEFT JOIN (
             SELECT DISTINCT ggm2.group_id
@@ -161,6 +163,7 @@ def get_galleries(
 
     # Standard query with LEFT JOIN for favorites info
     where_parts, params = _build_where(category, language, min_rating, min_fav, tag)
+    where_parts.append("g.is_active = TRUE")
 
     if is_favorited is True:
         where_parts.append("f.gid IS NOT NULL")
@@ -179,9 +182,11 @@ def get_galleries(
         LEFT JOIN user_favorites f ON g.gid = f.gid
         LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
         LEFT JOIN (
-            SELECT group_id, COUNT(*) AS cnt
-            FROM gallery_group_members
-            GROUP BY group_id
+            SELECT ggmc.group_id, COUNT(*) AS cnt
+            FROM gallery_group_members ggmc
+            JOIN eh_galleries gc2 ON gc2.gid = ggmc.gid
+            WHERE gc2.is_active = TRUE
+            GROUP BY ggmc.group_id
         ) gc ON gc.group_id = ggm.group_id
         LEFT JOIN (
             SELECT DISTINCT ggm2.group_id
@@ -226,7 +231,7 @@ def get_gallery_group(group_id: int, db = Depends(get_db)):
         FROM gallery_group_members ggm
         JOIN eh_galleries g ON g.gid = ggm.gid
         LEFT JOIN user_favorites f ON g.gid = f.gid
-        WHERE ggm.group_id = %s
+        WHERE ggm.group_id = %s AND g.is_active = TRUE
         ORDER BY g.posted_at ASC
         """,
         (group_id,),
@@ -248,9 +253,11 @@ def get_gallery(gid: int, db = Depends(get_db)):
         LEFT JOIN user_favorites f ON g.gid = f.gid
         LEFT JOIN gallery_group_members ggm ON g.gid = ggm.gid
         LEFT JOIN (
-            SELECT group_id, COUNT(*) AS cnt
-            FROM gallery_group_members
-            GROUP BY group_id
+            SELECT ggmc.group_id, COUNT(*) AS cnt
+            FROM gallery_group_members ggmc
+            JOIN eh_galleries gc2 ON gc2.gid = ggmc.gid
+            WHERE gc2.is_active = TRUE
+            GROUP BY ggmc.group_id
         ) gc ON gc.group_id = ggm.group_id
         WHERE g.gid = %s
         """,

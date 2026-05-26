@@ -122,7 +122,8 @@ func (d *DB) UpsertGalleriesBulk(ctx context.Context, rows []GalleryRow) (int, e
 		language = EXCLUDED.language, pages = EXCLUDED.pages,
 		rating = EXCLUDED.rating, fav_count = EXCLUDED.fav_count,
 		comment_count = EXCLUDED.comment_count, thumb = EXCLUDED.thumb,
-		tags = EXCLUDED.tags, last_synced_at = NOW(), is_active = EXCLUDED.is_active`
+		tags = EXCLUDED.tags, last_synced_at = NOW(),
+		is_active = eh_galleries.is_active AND EXCLUDED.is_active`
 
 	_, err = tx.Exec(ctx, sql, args...)
 	if err != nil {
