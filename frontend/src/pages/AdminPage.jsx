@@ -4,7 +4,6 @@ import {
   Loader2,
   CheckCircle2,
   XCircle,
-  Play,
   Square,
   Trash2,
   Plus,
@@ -12,6 +11,12 @@ import {
   ChevronDown,
   AlertTriangle,
   Info,
+  Activity,
+  Clock3,
+  Database,
+  GitBranch,
+  TerminalSquare,
+  Zap,
 } from 'lucide-react';
 import {
   createTask,
@@ -44,6 +49,13 @@ const DEFAULT_INCREMENTAL = {
   rating_diff_threshold: 0.5,
 };
 const DEFAULT_FAVORITES = { run_interval_hours: 6 };
+const ACTIVE_JOB_STATES = ['available', 'pending', 'scheduled', 'running', 'retryable'];
+const RETRYABLE_TERMINAL_STATES = ['cancelled', 'discarded', 'completed'];
+const ADMIN_TABS = [
+  { id: 'sync', label: 'Sync Runs' },
+  { id: 'queues', label: 'Queues' },
+  { id: 'recommendations', label: 'Recommendations' },
+];
 
 function getDefaultConfig(type) {
   if (type === 'favorites') return { ...DEFAULT_FAVORITES };
@@ -83,12 +95,6 @@ function isTransitioning(task) {
   return Boolean(task.requested_action);
 }
 
-function getDisplayStatus(task) {
-  if (task.current_job_state) return task.current_job_state;
-  if (task.enabled && task.schedule_kind === 'periodic') return 'scheduled';
-  return task.latest_job_state || (task.enabled ? 'enabled' : 'disabled');
-}
-
 function formatTaskKind(value) {
   if (value === 'gallery_sync') return 'Gallery Sync';
   if (value === 'favorites_sync') return 'Favorites Sync';
@@ -118,6 +124,92 @@ function formatTaskSchedule(task) {
   return 'manual';
 }
 
+function formatJobKind(value) {
+  if (value === 'ehstash_incremental_sync') return 'incremental kick';
+  if (value === 'ehstash_incremental_slice') return 'incremental slice';
+  if (value === 'ehstash_full_sync') return 'full sync';
+  if (value === 'ehstash_favorites_sync') return 'favorites sync';
+  return value || 'none';
+}
+
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleString(undefined, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function formatNumber(value) {
+  if (value == null || value === '') return '—';
+  const n = Number(value);
+  if (Number.isNaN(n)) return String(value);
+  return n.toLocaleString();
+}
+
+function activeCurrentJob(task) {
+  return ACTIVE_JOB_STATES.includes(task.current_job_state);
+}
+
+function getCheckpoint(task) {
+  return task.checkpoint || task.state || {};
+}
+
+function getTaskMode(task) {
+  if (task.source === 'favorites') return 'favorites';
+  if (task.source === 'gallery_list' && task.strategy === 'incremental') return 'incremental';
+  return 'full';
+}
+
+function getPrimaryState(task) {
+  if (task.requested_action) return `request: ${task.requested_action}`;
+  if (task.current_job_state) return task.current_job_state;
+  if (task.enabled && task.schedule_kind === 'periodic') return 'waiting';
+  if (task.latest_job_state) return task.latest_job_state;
+  return task.enabled ? 'enabled' : 'disabled';
+}
+
+function getProgressSummary(task) {
+  const checkpoint = getCheckpoint(task);
+  if (getTaskMode(task) === 'incremental') {
+    const scanned = Number(checkpoint.scanned_count || 0);
+    const scanWindow = Number(task.config?.scan_window || 10000);
+    const phase = task.current_job_kind === 'ehstash_incremental_sync'
+      ? 'kick'
+      : task.current_job_kind === 'ehstash_incremental_slice'
+        ? 'slice'
+        : checkpoint.run_id
+          ? 'chain'
+          : 'idle';
+    return `${phase} · ${formatNumber(scanned)} / ${formatNumber(scanWindow)}`;
+  }
+  const pct = Number(task.progress_pct || 0);
+  return `${pct < 1 ? pct.toFixed(3) : pct.toFixed(1)}%`;
+}
+
+function getProgressPercent(task) {
+  const checkpoint = getCheckpoint(task);
+  if (getTaskMode(task) === 'incremental') {
+    const scanned = Number(checkpoint.scanned_count || 0);
+    const scanWindow = Number(task.config?.scan_window || 10000);
+    return Math.max(0, Math.min(100, scanWindow ? (scanned / scanWindow) * 100 : 0));
+  }
+  return Math.max(0, Math.min(100, Number(task.progress_pct || 0)));
+}
+
+function getTaskSubtitle(task) {
+  const mode = getTaskMode(task);
+  const schedule = formatTaskSchedule(task);
+  if (mode === 'incremental') return `incremental · ${schedule}`;
+  if (mode === 'favorites') return `favorites · ${schedule}`;
+  return `${task.scope?.category || task.category || 'gallery'} · ${schedule}`;
+}
+
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
 const STATUS_CONFIG = {
@@ -129,6 +221,7 @@ const STATUS_CONFIG = {
   cancelled: { text: 'text-gray-400', ring: 'ring-gray-500/30', bg: 'bg-gray-500/10' },
   discarded: { text: 'text-rose-400', ring: 'ring-rose-500/30', bg: 'bg-rose-500/10' },
   enabled: { text: 'text-sky-300', ring: 'ring-sky-500/30', bg: 'bg-sky-500/10' },
+  waiting: { text: 'text-slate-300', ring: 'ring-slate-500/30', bg: 'bg-slate-500/10' },
   disabled: { text: 'text-gray-400', ring: 'ring-gray-500/30', bg: 'bg-gray-500/10' },
 };
 
@@ -173,6 +266,321 @@ function GradientProgressBar({ progress, dbCount, totalCount }) {
           }}
         />
       </div>
+    </div>
+  );
+}
+
+function MetaLine({ label, value, tone = 'default' }) {
+  const color = tone === 'strong' ? 'text-white' : tone === 'warn' ? 'text-amber-300' : tone === 'error' ? 'text-rose-300' : 'text-gray-300';
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs">
+      <span className="text-gray-500">{label}</span>
+      <span className={`font-mono text-right truncate ${color}`} title={value == null ? '' : String(value)}>
+        {value ?? '—'}
+      </span>
+    </div>
+  );
+}
+
+function RiverStateRail({ state }) {
+  const stages = ['available', 'scheduled', 'running', 'retryable', 'terminal'];
+  const terminal = ['completed', 'cancelled', 'discarded'].includes(state);
+  const active = terminal ? 'terminal' : state;
+
+  return (
+    <div className="flex items-center gap-1.5" aria-label={`River job state ${state || 'none'}`}>
+      {stages.map((stage, index) => {
+        const isActive = active === stage;
+        const complete = !terminal && stages.indexOf(active) > index;
+        return (
+          <React.Fragment key={stage}>
+            <span
+              title={stage}
+              className={`h-2 w-2 rounded-full border ${isActive
+                ? state === 'discarded'
+                  ? 'bg-rose-400 border-rose-300 shadow-[0_0_0_3px_rgba(244,63,94,0.12)]'
+                  : state === 'retryable'
+                    ? 'bg-amber-300 border-amber-200 shadow-[0_0_0_3px_rgba(251,191,36,0.12)]'
+                    : 'bg-cyan-300 border-cyan-200 shadow-[0_0_0_3px_rgba(34,211,238,0.12)]'
+                : complete
+                  ? 'bg-gray-500/70 border-gray-500/70'
+                  : 'bg-transparent border-white/15'
+                }`}
+            />
+            {index < stages.length - 1 && (
+              <span className={`h-px w-5 ${complete ? 'bg-gray-500/70' : 'bg-white/10'}`} aria-hidden="true" />
+            )}
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+function TaskHeaderStrip({ tasks }) {
+  const activeJobs = tasks.filter(activeCurrentJob).length;
+  const enabled = tasks.filter((task) => task.enabled).length;
+  const requested = tasks.filter((task) => task.requested_action).length;
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-zinc-950/60 px-4 py-2.5 text-xs text-gray-400">
+      <span><span className="font-mono text-white">{activeJobs}</span> active</span>
+      <span><span className="font-mono text-white">{enabled}</span> enabled</span>
+      {requested > 0 && <span className="text-amber-300"><span className="font-mono">{requested}</span> pending</span>}
+    </div>
+  );
+}
+
+function DefinitionPanel({ task }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Database size={14} className={task.enabled ? 'text-emerald-400' : 'text-gray-500'} />
+        <span className="text-xs uppercase tracking-wider text-gray-500">Definition</span>
+      </div>
+      <div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-semibold text-white">{task.name}</span>
+          <span className={`text-xs font-mono ${task.enabled ? 'text-emerald-300' : 'text-gray-500'}`}>
+            {task.enabled ? 'enabled' : 'disabled'}
+          </span>
+        </div>
+        <p className="mt-1 text-xs text-gray-500">{formatTaskScope(task)}</p>
+      </div>
+      <div className="grid gap-1.5">
+        <MetaLine label="kind" value={formatTaskKind(task.task_kind)} />
+        <MetaLine label="strategy" value={task.strategy || task.type || 'sync'} />
+        <MetaLine label="schedule" value={formatTaskSchedule(task)} />
+        {task.requested_action && (
+          <MetaLine label="request" value={task.requested_action} tone="warn" />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RiverJobPanel({ task }) {
+  const state = task.current_job_state || (task.enabled && task.schedule_kind === 'periodic' ? 'waiting' : task.latest_job_state);
+  const active = activeCurrentJob(task);
+  const jobID = active ? task.current_job_id : task.last_job_id;
+  const kind = active ? task.current_job_kind : task.latest_job_kind;
+  const attempt = active ? task.current_job_attempt : task.latest_job_attempt;
+  const maxAttempts = active ? task.current_job_max_attempts : task.latest_job_max_attempts;
+  const attemptedAt = active ? task.current_job_attempted_at : task.latest_job_attempted_at;
+  const finalizedAt = active ? task.current_job_finalized_at : task.latest_job_finalized_at;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <TerminalSquare size={14} className={active ? 'text-cyan-300' : 'text-gray-500'} />
+          <span className="text-xs uppercase tracking-wider text-gray-500">River Job</span>
+        </div>
+        {task.current_job_state ? <RiverStateRail state={task.current_job_state} /> : null}
+      </div>
+      {task.current_job_state ? (
+        <StatusBadge status={task.current_job_state} />
+      ) : task.enabled && task.schedule_kind === 'periodic' ? (
+        <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
+          <Clock3 size={12} />
+          waiting for periodic kick
+        </span>
+      ) : (
+        <StatusBadge status={state || 'disabled'} />
+      )}
+      <div className="grid gap-1.5">
+        <MetaLine label={active ? 'current job' : 'last job'} value={jobID ? `#${jobID}` : 'none'} tone={active ? 'strong' : 'default'} />
+        <MetaLine label="kind" value={formatJobKind(kind)} />
+        <MetaLine label="attempt" value={attempt ? `${attempt}/${maxAttempts || '—'}` : '—'} />
+        <MetaLine label={active ? 'attempted' : 'finalized'} value={formatTimestamp(active ? attemptedAt : finalizedAt)} />
+      </div>
+      {task.error_message && (
+        <div className="rounded-md border border-rose-500/20 bg-rose-500/10 px-2.5 py-2 text-xs text-rose-300 truncate" title={task.error_message}>
+          {task.error_message}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IncrementalCheckpoint({ task, checkpoint }) {
+  const scanned = Number(checkpoint.scanned_count || 0);
+  const scanWindow = Number(task.config?.scan_window || 10000);
+  const pct = Math.max(0, Math.min(100, scanWindow ? (scanned / scanWindow) * 100 : 0));
+  const activeKind = task.current_job_kind === 'ehstash_incremental_sync'
+    ? 'kick'
+    : task.current_job_kind === 'ehstash_incremental_slice'
+      ? 'slice'
+      : checkpoint.run_id
+        ? 'chain'
+        : 'idle';
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <GitBranch size={14} className={checkpoint.run_id ? 'text-cyan-300' : 'text-gray-500'} />
+          <span className="text-xs uppercase tracking-wider text-gray-500">Checkpoint</span>
+        </div>
+        <span className="text-xs font-mono text-gray-400">{activeKind}</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+        <div className="h-full bg-cyan-400/80 transition-all duration-700" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="grid gap-1.5">
+        <MetaLine label="round" value={formatNumber(checkpoint.round || 0)} />
+        <MetaLine label="run_id" value={checkpoint.run_id || 'none'} tone={checkpoint.run_id ? 'strong' : 'default'} />
+        <MetaLine label="window" value={`${formatNumber(scanned)} / ${formatNumber(scanWindow)}`} />
+        <MetaLine label="next_gid" value={formatNumber(checkpoint.next_gid)} />
+        <MetaLine label="latest_gid" value={formatNumber(checkpoint.latest_gid)} />
+      </div>
+    </div>
+  );
+}
+
+function GenericCheckpoint({ task, checkpoint }) {
+  const mode = getTaskMode(task);
+  const progress = Number(task.progress_pct || 0);
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Activity size={14} className="text-gray-400" />
+        <span className="text-xs uppercase tracking-wider text-gray-500">Checkpoint</span>
+      </div>
+      <GradientProgressBar
+        progress={progress}
+        dbCount={mode === 'favorites' ? null : (checkpoint.db_count ?? null)}
+        totalCount={mode === 'favorites' ? null : (checkpoint.total_count ?? null)}
+      />
+      <div className="grid gap-1.5">
+        <MetaLine label="round" value={formatNumber(checkpoint.round || 0)} />
+        <MetaLine label="next_gid" value={formatNumber(checkpoint.next_gid)} />
+        {checkpoint.done != null && <MetaLine label="done" value={String(Boolean(checkpoint.done))} />}
+        {checkpoint.anchor_gid != null && <MetaLine label="anchor_gid" value={formatNumber(checkpoint.anchor_gid)} />}
+      </div>
+    </div>
+  );
+}
+
+function CheckpointPanel({ task }) {
+  const checkpoint = getCheckpoint(task);
+  if (getTaskMode(task) === 'incremental') {
+    return <IncrementalCheckpoint task={task} checkpoint={checkpoint} />;
+  }
+  return <GenericCheckpoint task={task} checkpoint={checkpoint} />;
+}
+
+function SyncTaskRunRow({ task, rowAction, runTaskAction, setDeleteTarget, expanded, onToggle }) {
+  const transition = isTransitioning(task);
+  const rowBusy = Boolean(rowAction);
+  const currentJobActive = activeCurrentJob(task);
+  const canStart = !rowBusy && !transition && !task.enabled && !currentJobActive;
+  const canStop = !rowBusy && !transition && (task.enabled || currentJobActive);
+  const canRetry = !rowBusy && !transition && !currentJobActive && RETRYABLE_TERMINAL_STATES.includes(task.latest_job_state);
+  const canDelete = !rowBusy && !transition && !task.enabled && !currentJobActive;
+  const isIncremental = getTaskMode(task) === 'incremental';
+  const primaryState = getPrimaryState(task);
+  const progress = getProgressPercent(task);
+  const attention = task.error_message || task.current_job_state === 'retryable' || task.latest_job_state === 'discarded' || transition;
+
+  return (
+    <div className={`rounded-lg border bg-zinc-950/45 transition-colors ${attention ? 'border-amber-500/30' : 'border-white/10 hover:border-white/20'}`}>
+      <div className="grid items-center gap-3 px-4 py-3 lg:grid-cols-[minmax(0,1fr)_210px_150px_auto]">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className={`h-2 w-2 rounded-full shrink-0 ${activeCurrentJob(task)
+              ? 'bg-cyan-300'
+              : task.enabled
+                ? 'bg-emerald-400'
+                : 'bg-gray-600'
+              }`}
+            />
+            <span className="truncate text-sm font-semibold text-white">{task.name}</span>
+            {attention && <AlertTriangle size={13} className="shrink-0 text-amber-300" />}
+          </div>
+          <p className="mt-0.5 truncate text-xs text-gray-500">{getTaskSubtitle(task)}</p>
+        </div>
+
+        <div className="flex items-center gap-2 min-w-0">
+          <StatusBadge status={primaryState.startsWith('request:') ? 'retryable' : primaryState} />
+          <span className="truncate text-xs font-mono text-gray-500">
+            {task.current_job_kind ? formatJobKind(task.current_job_kind) : task.enabled && task.schedule_kind === 'periodic' ? 'next kick' : formatJobKind(task.latest_job_kind)}
+          </span>
+        </div>
+
+        <div className="min-w-0">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="truncate text-xs font-mono text-gray-300">{getProgressSummary(task)}</span>
+          </div>
+          <div className="h-1 w-full overflow-hidden rounded-full bg-white/10">
+            <div className="h-full bg-cyan-400/75 transition-all duration-700" style={{ width: `${progress}%` }} />
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-1">
+          <button
+            title={isIncremental ? '启用并投递 kick' : '启动任务'}
+            aria-label={`启动任务 ${task.name}`}
+            disabled={!canStart}
+            onClick={() => runTaskAction(task.id, 'start', () => startTask(task.id))}
+            className="inline-flex items-center justify-center gap-2 rounded-md border border-emerald-500/20 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+          >
+            {rowAction === 'start' ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+          </button>
+          <button
+            title="取消当前 job 或停用定义"
+            aria-label={`停止任务 ${task.name}`}
+            disabled={!canStop}
+            onClick={() => runTaskAction(task.id, 'stop', () => stopTask(task.id))}
+            className="inline-flex items-center justify-center gap-2 rounded-md border border-amber-500/20 px-3 py-2 text-xs text-amber-300 hover:bg-amber-500/10 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+          >
+            {rowAction === 'stop' ? <Loader2 size={14} className="animate-spin" /> : <Square size={14} />}
+          </button>
+          <button
+            title="重试最近 job"
+            aria-label={`重试任务 ${task.name}`}
+            disabled={!canRetry}
+            onClick={() => runTaskAction(task.id, 'retry', () => retryTask(task.id))}
+            className="inline-flex items-center justify-center gap-2 rounded-md border border-cyan-500/20 px-3 py-2 text-xs text-cyan-300 hover:bg-cyan-500/10 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+          >
+            {rowAction === 'retry' ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+          </button>
+          <button
+            title="删除任务定义"
+            aria-label={`删除任务 ${task.name}`}
+            disabled={!canDelete}
+            onClick={() => setDeleteTarget(task)}
+            className="inline-flex items-center justify-center gap-2 rounded-md border border-rose-500/20 px-3 py-2 text-xs text-rose-300 hover:bg-rose-500/10 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+          >
+            {rowAction === 'delete' ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+          </button>
+          <button
+            type="button"
+            title={expanded ? '收起详情' : '展开详情'}
+            aria-label={`${expanded ? '收起' : '展开'}任务 ${task.name} 详情`}
+            onClick={onToggle}
+            className="inline-flex items-center justify-center rounded-md border border-white/10 px-2.5 py-2 text-xs text-gray-400 hover:bg-white/5 hover:text-white transition-all"
+          >
+            <ChevronDown size={14} className={`transition-transform ${expanded ? 'rotate-180' : ''}`} />
+          </button>
+        </div>
+      </div>
+      {transition && (
+        <div className="mx-4 mb-3 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+          manager request pending: <span className="font-mono">{task.requested_action}</span>
+        </div>
+      )}
+      {task.error_message && !expanded && (
+        <div className="mx-4 mb-3 truncate rounded-md border border-rose-500/20 bg-rose-500/10 px-3 py-2 text-xs text-rose-300" title={task.error_message}>
+          {task.error_message}
+        </div>
+      )}
+      {expanded && (
+        <div className="grid gap-5 border-t border-white/10 px-4 py-4 lg:grid-cols-3">
+          <DefinitionPanel task={task} />
+          <RiverJobPanel task={task} />
+          <CheckpointPanel task={task} />
+        </div>
+      )}
     </div>
   );
 }
@@ -554,7 +962,6 @@ function SimilarityDistributionPanel() {
   const { data: statusData } = useQuery({
     queryKey: ['admin', 'embeddingsStatus'],
     queryFn: getEmbeddingsStatus,
-    refetchInterval: 5000,
   });
 
   const [localThreshold, setLocalThreshold] = useState(null);
@@ -730,6 +1137,90 @@ function SimilarityDistributionPanel() {
   );
 }
 
+function SyncRunsPanel({
+  tasks,
+  isLoading,
+  pendingByTask,
+  runTaskAction,
+  setDeleteTarget,
+}) {
+  const [expandedTaskIds, setExpandedTaskIds] = useState(() => new Set());
+  const toggleTask = (taskId) => {
+    setExpandedTaskIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  };
+
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-white/10 bg-zinc-950/45 flex justify-center items-center py-12">
+        <Loader2 size={24} className="animate-spin text-gray-500" />
+      </div>
+    );
+  }
+
+  if (tasks.length === 0) {
+    return (
+      <div className="rounded-lg border border-white/10 bg-zinc-950/45 text-center py-12 text-gray-500 text-sm">
+        暂无任务，点击「新建任务」开始
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <TaskHeaderStrip tasks={tasks} />
+      <div className="space-y-2">
+        {tasks.map((task) => (
+          <SyncTaskRunRow
+            key={task.id}
+            task={task}
+            rowAction={pendingByTask[task.id]}
+            runTaskAction={runTaskAction}
+            setDeleteTarget={setDeleteTarget}
+            expanded={expandedTaskIds.has(task.id)}
+            onToggle={() => toggleTask(task.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function QueuesPanel({ stats }) {
+  return (
+    <div>
+      <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Thumb Queue</p>
+      <div className="rounded-lg border border-white/10 bg-zinc-950/45 p-4 shadow-sm">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 w-full">
+          <QueueStage
+            icon={Loader2}
+            label="Waiting"
+            value={stats.waiting}
+            color="text-orange-400"
+            infoTitle="失败重试等待中，冷却后进入 Pending"
+          />
+          <QueueStage icon={RefreshCw} label="Pending" value={stats.pending} color="text-yellow-400" />
+          <QueueStage icon={Loader2} label="Processing" value={stats.processing} color="text-blue-400" />
+          <QueueStage icon={CheckCircle2} label="Done" value={stats.done} color="text-emerald-400" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RecommendationsPanel() {
+  return (
+    <div>
+      <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Recommended Score Distribution</p>
+      <SimilarityDistributionPanel />
+    </div>
+  );
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function AdminPage() {
@@ -738,10 +1229,9 @@ export default function AdminPage() {
   const [errorMsg, setErrorMsg] = useState('');
   const [pendingByTask, setPendingByTask] = useState({});
   const [deleteTarget, setDeleteTarget] = useState(null);
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [activeTab, setActiveTab] = useState('sync');
 
   const modalOpen = openCreate || Boolean(deleteTarget);
-  const shouldPoll = autoRefresh && !modalOpen;
 
   const tasksQuery = useQuery({
     queryKey: ['admin', 'tasks'],
@@ -752,25 +1242,37 @@ export default function AdminPage() {
   const thumbQuery = useQuery({
     queryKey: ['admin', 'thumbStats'],
     queryFn: getThumbStats,
-    refetchInterval: shouldPoll ? 5000 : false,
+    refetchInterval: false,
   });
-
-  const isFetching = tasksQuery.isFetching || thumbQuery.isFetching;
 
   const tasks = tasksQuery.data || [];
   const stats = thumbQuery.data || { pending: 0, processing: 0, done: 0, waiting: 0 };
 
+  const refreshActiveTab = useCallback(() => {
+    if (activeTab === 'sync') {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
+    } else if (activeTab === 'queues') {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'thumbStats'] });
+    } else if (activeTab === 'recommendations') {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'similarityDistribution'] });
+      queryClient.invalidateQueries({ queryKey: ['admin', 'embeddingsStatus'] });
+    }
+  }, [activeTab, queryClient]);
+
   useEffect(() => {
-    if (!shouldPoll) return undefined;
+    if (modalOpen) return undefined;
     const source = new EventSource('/api/v1/admin/events');
     source.addEventListener('admin.task', () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
     });
+    source.addEventListener('ping', () => {
+      refreshActiveTab();
+    });
     source.onerror = () => {
-      queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
+      refreshActiveTab();
     };
     return () => source.close();
-  }, [queryClient, shouldPoll]);
+  }, [modalOpen, queryClient, refreshActiveTab]);
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
@@ -837,35 +1339,6 @@ export default function AdminPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setAutoRefresh((v) => !v)}
-            className={`relative p-2.5 rounded-lg transition-all ${autoRefresh
-              ? 'text-emerald-400 hover:bg-emerald-500/10'
-              : 'text-gray-400 hover:text-white hover:bg-white/10'
-              }`}
-            aria-label={autoRefresh ? '暂停自动刷新' : '开启自动刷新'}
-            aria-pressed={autoRefresh}
-          >
-            {autoRefresh && (
-              <svg
-                className="absolute inset-0 w-full h-full pointer-events-none"
-                viewBox="0 0 32 32"
-                fill="none"
-                aria-hidden="true"
-              >
-                <circle
-                  cx="16" cy="16" r="13"
-                  strokeWidth="1.5"
-                  transform="rotate(-90 16 16)"
-                  style={{
-                    strokeDasharray: '81.68',
-                    animation: 'refresh-ring 5s linear infinite, refresh-ring-pulse 5s linear infinite',
-                  }}
-                />
-              </svg>
-            )}
-            <RefreshCw size={16} className={isFetching ? 'animate-spin' : ''} />
-          </button>
-          <button
             onClick={() => setOpenCreate(true)}
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all"
           >
@@ -892,159 +1365,39 @@ export default function AdminPage() {
         </div>
       )}
 
-      {/* Queue Flow */}
-      <div>
-        <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Thumb Queue</p>
-        <div className="rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4 shadow-sm">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 w-full">
-            <QueueStage
-              icon={Loader2}
-              label="Waiting"
-              value={stats.waiting}
-              color="text-orange-400"
-              infoTitle="失败重试等待中，冷却后进入 Pending"
-            />
-            <QueueStage icon={RefreshCw} label="Pending" value={stats.pending} color="text-yellow-400" />
-            <QueueStage icon={Loader2} label="Processing" value={stats.processing} color="text-blue-400" />
-            <QueueStage icon={CheckCircle2} label="Done" value={stats.done} color="text-emerald-400" />
-          </div>
+      <div className="border-b border-white/10">
+        <div className="flex items-center gap-1 overflow-x-auto">
+          {ADMIN_TABS.map((tab) => {
+            const active = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={`px-3 py-2 text-sm border-b transition-colors whitespace-nowrap ${active
+                  ? 'border-cyan-300 text-white'
+                  : 'border-transparent text-gray-500 hover:text-gray-300'
+                  }`}
+                aria-pressed={active}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
-      {/* Recommended Score Distribution */}
-      <div>
-        <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Recommended Score Distribution</p>
-        <SimilarityDistributionPanel />
-      </div>
-
-      {/* Sync Tasks */}
-      <div>
-        <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Sync Tasks</p>
-        {tasksQuery.isLoading ? (
-          <div className="rounded-xl border border-white/10 bg-white/5 flex justify-center items-center py-12">
-            <Loader2 size={24} className="animate-spin text-gray-500" />
-          </div>
-        ) : tasks.length === 0 ? (
-          <div className="rounded-xl border border-white/10 bg-white/5 text-center py-12 text-gray-500 text-sm">
-            暂无任务，点击「新建任务」开始
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {tasks.map((task) => {
-              const progress = Number(task.progress_pct || 0);
-              const isIncremental = task.source === 'gallery_list' && task.strategy === 'incremental';
-              const isFavoritesSource = task.source === 'favorites';
-              const dbCount = isIncremental
-                ? (task.state?.scanned_count ?? null)
-                : isFavoritesSource
-                  ? null
-                  : (task.state?.db_count ?? null);
-              const totalCount = isIncremental
-                ? (task.config?.scan_window ?? null)
-                : isFavoritesSource
-                  ? null
-                  : (task.state?.total_count ?? null);
-              const transition = isTransitioning(task);
-              const displayStatus = getDisplayStatus(task);
-              const rowAction = pendingByTask[task.id];
-              const rowBusy = Boolean(rowAction);
-
-              const activeStates = ['available', 'scheduled', 'running', 'retryable'];
-              const retryStates = ['cancelled', 'discarded', 'completed'];
-              const currentJobActive = activeStates.includes(task.current_job_state);
-              const canStart = !rowBusy && !transition && !task.enabled && !currentJobActive;
-              const canStop = !rowBusy && !transition && (task.enabled || currentJobActive);
-              const canRetry = !rowBusy && !transition && !currentJobActive && retryStates.includes(task.latest_job_state);
-              const canDelete = !rowBusy && !transition && !task.enabled && !currentJobActive;
-
-              return (
-                <div
-                  key={task.id}
-                  className="rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4 hover:border-white/20 transition-colors"
-                >
-                  {/* Row 1: name + status + actions */}
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-medium text-white text-sm">{task.name}</span>
-                        <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">{formatTaskKind(task.task_kind)}</span>
-                        <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">{task.strategy || 'sync'}</span>
-                        <StatusBadge status={displayStatus} />
-                        {transition && (
-                          <span className="text-xs font-mono text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded">
-                            request: {task.requested_action}
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-xs text-gray-500 mt-1">{formatTaskScope(task)} · {formatTaskSchedule(task)}</p>
-                      {(task.current_job_id || task.last_job_id) && (
-                        <p className="text-xs text-gray-600 mt-1 font-mono">
-                          current_job: {task.current_job_id ?? '-'} · last_job: {task.last_job_id ?? '-'}
-                        </p>
-                      )}
-                      {task.error_message && (
-                        <p className="text-xs text-rose-400 mt-1 truncate" title={task.error_message}>
-                          {task.error_message}
-                        </p>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        title="启动"
-                        aria-label={`启动任务 ${task.name}`}
-                        disabled={!canStart}
-                        onClick={() => runTaskAction(task.id, 'start', () => startTask(task.id))}
-                        className="p-2 rounded-lg text-emerald-400 hover:bg-emerald-500/20 transition-all
-                                   disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-                      >
-                        {rowAction === 'start' ? <Loader2 size={15} className="animate-spin" /> : <Play size={15} />}
-                      </button>
-                      <button
-                        title="停止"
-                        aria-label={`停止任务 ${task.name}`}
-                        disabled={!canStop}
-                        onClick={() => runTaskAction(task.id, 'stop', () => stopTask(task.id))}
-                        className="p-2 rounded-lg text-yellow-400 hover:bg-yellow-500/20 transition-all
-                                   disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-                      >
-                        {rowAction === 'stop' ? <Loader2 size={15} className="animate-spin" /> : <Square size={15} />}
-                      </button>
-                      <button
-                        title="重试"
-                        aria-label={`重试任务 ${task.name}`}
-                        disabled={!canRetry}
-                        onClick={() => runTaskAction(task.id, 'retry', () => retryTask(task.id))}
-                        className="p-2 rounded-lg text-cyan-400 hover:bg-cyan-500/20 transition-all
-                                   disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-                      >
-                        {rowAction === 'retry' ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
-                      </button>
-                      <button
-                        title="删除"
-                        aria-label={`删除任务 ${task.name}`}
-                        disabled={!canDelete}
-                        onClick={() => setDeleteTarget(task)}
-                        className="p-2 rounded-lg text-rose-400 hover:bg-rose-500/20 transition-all
-                                   disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-                      >
-                        {rowAction === 'delete' ? <Loader2 size={15} className="animate-spin" /> : <Trash2 size={15} />}
-                      </button>
-                    </div>
-                  </div>
-                  {/* Row 2: progress */}
-                  <div className="mt-3">
-                    <GradientProgressBar
-                      progress={progress}
-                      dbCount={dbCount}
-                      totalCount={totalCount}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
+      {activeTab === 'sync' && (
+        <SyncRunsPanel
+          tasks={tasks}
+          isLoading={tasksQuery.isLoading}
+          pendingByTask={pendingByTask}
+          runTaskAction={runTaskAction}
+          setDeleteTarget={setDeleteTarget}
+        />
+      )}
+      {activeTab === 'queues' && <QueuesPanel stats={stats} />}
+      {activeTab === 'recommendations' && <RecommendationsPanel />}
 
       {/* Create Task Modal */}
       <CreateTaskModal
