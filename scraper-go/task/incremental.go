@@ -6,216 +6,323 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/CheerChen/eh-stash/scraper-go/client"
 	"github.com/CheerChen/eh-stash/scraper-go/db"
 	"github.com/CheerChen/eh-stash/scraper-go/parser"
 )
 
-// RunIncrementalOnce runs one iteration of the incremental scan task.
-func RunIncrementalOnce(
+// IncrementalSliceResult is what RunIncrementalSlice returns to the worker so
+// it can decide whether to chain another slice, finalize the round, or surface
+// an exit reason.
+type IncrementalSliceResult struct {
+	ExitReason string  // "" = continue, "END"/"WINDOW" = round done, "BANNED"/"ERROR" = pause round
+	Checkpoint map[string]any
+	Pct        float64
+}
+
+// RunIncrementalSlice fetches exactly one page of the incremental scan and
+// returns the updated checkpoint. The worker is responsible for persisting it
+// and deciding the next action. Stop is signaled via ctx cancellation.
+func RunIncrementalSlice(
 	ctx context.Context,
 	database *db.DB,
 	httpClient *client.Client,
-	taskID int,
-	runtime *db.SyncTask,
+	def *db.TaskDef,
 	grouperTrigger chan struct{},
-) (bool, error) {
-	name := runtime.Name
+) (IncrementalSliceResult, error) {
+	name := def.Name
 
-	// Parse config
-	categories := parseCategories(runtime.Config)
+	categories := parseCategories(def.Config)
 	scanWindow := 10000
-	if v, ok := runtime.Config["scan_window"]; ok {
+	if v, ok := def.Config["scan_window"]; ok {
 		if f, ok := v.(float64); ok && f > 0 {
 			scanWindow = int(f)
 		}
 	}
 	ratingThreshold := 0.5
-	if v, ok := runtime.Config["rating_diff_threshold"]; ok {
+	if v, ok := def.Config["rating_diff_threshold"]; ok {
 		if f, ok := v.(float64); ok {
 			ratingThreshold = f
 		}
 	}
 
-	// Normalize state
-	state := make(map[string]any)
-	for k, v := range runtime.State {
-		state[k] = v
+	checkpoint := cloneState(def.Checkpoint)
+	nextCursor := getStateString(checkpoint, "next_gid")
+	scannedCount := getStateInt(checkpoint, "scanned_count")
+
+	pctFor := func(scanned int) float64 {
+		return ClampProgress(float64(scanned) / float64(scanWindow) * 100)
 	}
 
-	nextCursor := getStateString(state, "next_gid")
-	scannedCount := getStateInt(state, "scanned_count")
-	roundNum := getStateInt(state, "round")
+	result := IncrementalSliceResult{Checkpoint: checkpoint, Pct: pctFor(scannedCount)}
 
-	exitReason := ""
+	slog.Info("[INCR ] slice start",
+		"name", name,
+		"next_gid", nextCursor,
+		"scanned_count", scannedCount,
+		"scan_window", scanWindow,
+		"categories", categories,
+	)
 
-	for exitReason == "" {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		default:
-		}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 
-		// Check desired_status
-		rt, err := database.GetTaskRuntime(ctx, taskID)
-		if err != nil {
-			return false, err
-		}
-		if rt == nil || rt.DesiredStatus != "running" {
-			_ = database.UpdateTaskRuntime(ctx, taskID,
-				db.WithState(state), db.WithStatus("stopped"), db.WithTouchRunTime())
-			return true, nil
-		}
+	listURL := BuildListURL(httpClient.BaseURL(), categories, nextCursor)
+	listStart := time.Now()
+	body, fetchResult, err := httpClient.FetchPage(ctx, listURL)
+	listLatency := time.Since(listStart)
+	if err != nil {
+		slog.Warn("[INCR ] list fetch failed", "name", name, "url", listURL, "latency", listLatency, "error", err)
+		result.ExitReason = "ERROR"
+		return result, nil
+	}
+	if fetchResult == client.ResultBanned {
+		slog.Warn("[INCR ] list fetch banned", "name", name, "url", listURL, "latency", listLatency)
+		result.ExitReason = "BANNED"
+		return result, nil
+	}
+	slog.Info("[INCR ] list fetched", "name", name, "url", listURL, "latency", listLatency, "bytes", len(body))
 
-		// Fetch list page
-		listURL := BuildListURL(httpClient.BaseURL(), categories, nextCursor)
-		body, result, err := httpClient.FetchPage(ctx, listURL)
-		if err != nil {
-			slog.Warn(fmt.Sprintf("[INCR ] [%s] fetch failed", name), "error", err)
-			exitReason = "ERROR"
-			break
-		}
-		if result == client.ResultBanned {
-			exitReason = "BANNED"
-			break
-		}
+	listResult, err := parser.ParseGalleryList(body)
+	if err != nil {
+		slog.Error("[INCR ] list parse failed", "name", name, "error", err)
+		result.ExitReason = "ERROR"
+		return result, nil
+	}
 
-		listResult, err := parser.ParseGalleryList(body)
-		if err != nil {
-			slog.Error(fmt.Sprintf("[INCR ] [%s] parse failed", name), "error", err)
-			exitReason = "ERROR"
-			break
-		}
+	if len(listResult.Items) == 0 {
+		slog.Info("[INCR ] list empty, round ending", "name", name)
+		result.ExitReason = "END"
+		return result, nil
+	}
 
-		if len(listResult.Items) == 0 {
-			exitReason = "END"
-			break
-		}
+	hasNext := listResult.NextCursor != nil
+	nextStr := ""
+	if hasNext {
+		nextStr = *listResult.NextCursor
+	}
+	slog.Info("[INCR ] list parsed",
+		"name", name,
+		"items", len(listResult.Items),
+		"has_next", hasNext,
+		"next_cursor", nextStr,
+	)
 
-		// First page: record latest_gid
-		if state["latest_gid"] == nil {
-			maxGID := int64(0)
-			for _, item := range listResult.Items {
-				if item.GID > maxGID {
-					maxGID = item.GID
-				}
-			}
-			state["latest_gid"] = float64(maxGID)
-		}
-
-		// Process items
-		var rowsToUpsert []db.GalleryRow
-		nNew, nRefresh, nSkip := 0, 0, 0
-
+	if checkpoint["latest_gid"] == nil {
+		maxGID := int64(0)
 		for _, item := range listResult.Items {
-			existing, err := database.GetGalleryByGID(ctx, item.GID)
-			if err != nil {
-				slog.Error(fmt.Sprintf("[INCR ] [%s] DB error for gid=%d", name, item.GID), "error", err)
+			if item.GID > maxGID {
+				maxGID = item.GID
+			}
+		}
+		checkpoint["latest_gid"] = float64(maxGID)
+	}
+
+	var rowsToUpsert []db.GalleryRow
+	nNew, nRefresh, nSkip := 0, 0, 0
+	banned := false
+	total := len(listResult.Items)
+
+	for i, item := range listResult.Items {
+		if err := ctx.Err(); err != nil {
+			slog.Warn("[INCR ] item loop cancelled",
+				"name", name,
+				"i", i+1,
+				"total", total,
+				"new_so_far", nNew,
+				"refresh_so_far", nRefresh,
+				"skip_so_far", nSkip,
+				"ctx_err", err,
+			)
+			return result, err
+		}
+		existing, err := database.GetGalleryByGID(ctx, item.GID)
+		if err != nil {
+			slog.Error("[INCR ] item DB lookup failed",
+				"name", name,
+				"i", i+1,
+				"total", total,
+				"gid", item.GID,
+				"error", err,
+			)
+			continue
+		}
+
+		if item.IsDeleted && existing != nil {
+			_ = database.MarkGalleryInactive(ctx, item.GID)
+			nSkip++
+			slog.Info("[INCR ] item deleted",
+				"name", name,
+				"i", i+1,
+				"total", total,
+				"gid", item.GID,
+			)
+			continue
+		}
+
+		if existing == nil {
+			slog.Info("[INCR ] item new, fetching detail",
+				"name", name,
+				"i", i+1,
+				"total", total,
+				"gid", item.GID,
+			)
+			detailURL := BuildDetailURL(httpClient.BaseURL(), item.GID, item.Token)
+			detailStart := time.Now()
+			detailBody, detailResult, err := httpClient.FetchPage(ctx, detailURL)
+			detailLatency := time.Since(detailStart)
+			if err != nil || detailResult != client.ResultOK {
+				slog.Warn("[INCR ] detail fetch failed",
+					"name", name,
+					"i", i+1,
+					"gid", item.GID,
+					"latency", detailLatency,
+					"result", detailResult,
+					"error", err,
+				)
+				if detailResult == client.ResultBanned {
+					banned = true
+					break
+				}
 				continue
 			}
-
-			if item.IsDeleted && existing != nil {
-				_ = database.MarkGalleryInactive(ctx, item.GID)
-				nSkip++
+			detail, err := parser.ParseDetail(detailBody)
+			if err != nil || detail == nil {
+				slog.Warn("[INCR ] detail parse failed",
+					"name", name,
+					"i", i+1,
+					"gid", item.GID,
+					"latency", detailLatency,
+					"error", err,
+				)
 				continue
 			}
-
-			if existing == nil {
-				// New gallery
+			rowsToUpsert = append(rowsToUpsert, BuildUpsertRow(item.GID, item.Token, detail, true))
+			nNew++
+			slog.Info("[INCR ] item new ok",
+				"name", name,
+				"i", i+1,
+				"total", total,
+				"gid", item.GID,
+				"latency", detailLatency,
+			)
+		} else {
+			shouldRefresh := shouldRefreshFromList(existing, &item, ratingThreshold)
+			if shouldRefresh {
+				slog.Info("[INCR ] item refresh, fetching detail",
+					"name", name,
+					"i", i+1,
+					"total", total,
+					"gid", item.GID,
+				)
 				detailURL := BuildDetailURL(httpClient.BaseURL(), item.GID, item.Token)
+				detailStart := time.Now()
 				detailBody, detailResult, err := httpClient.FetchPage(ctx, detailURL)
+				detailLatency := time.Since(detailStart)
 				if err != nil || detailResult != client.ResultOK {
+					slog.Warn("[INCR ] detail fetch failed (refresh)",
+						"name", name,
+						"i", i+1,
+						"gid", item.GID,
+						"latency", detailLatency,
+						"result", detailResult,
+						"error", err,
+					)
 					if detailResult == client.ResultBanned {
-						exitReason = "BANNED"
+						banned = true
 						break
 					}
 					continue
 				}
 				detail, err := parser.ParseDetail(detailBody)
 				if err != nil || detail == nil {
+					slog.Warn("[INCR ] detail parse failed (refresh)",
+						"name", name,
+						"i", i+1,
+						"gid", item.GID,
+						"latency", detailLatency,
+						"error", err,
+					)
 					continue
 				}
 				rowsToUpsert = append(rowsToUpsert, BuildUpsertRow(item.GID, item.Token, detail, true))
-				nNew++
+				nRefresh++
+				slog.Info("[INCR ] item refresh ok",
+					"name", name,
+					"i", i+1,
+					"total", total,
+					"gid", item.GID,
+					"latency", detailLatency,
+				)
 			} else {
-				// Check if refresh needed
-				shouldRefresh := shouldRefreshFromList(existing, &item, ratingThreshold)
-				if shouldRefresh {
-					detailURL := BuildDetailURL(httpClient.BaseURL(), item.GID, item.Token)
-					detailBody, detailResult, err := httpClient.FetchPage(ctx, detailURL)
-					if err != nil || detailResult != client.ResultOK {
-						if detailResult == client.ResultBanned {
-							exitReason = "BANNED"
-							break
-						}
-						continue
-					}
-					detail, err := parser.ParseDetail(detailBody)
-					if err != nil || detail == nil {
-						continue
-					}
-					rowsToUpsert = append(rowsToUpsert, BuildUpsertRow(item.GID, item.Token, detail, true))
-					nRefresh++
-				} else {
-					nSkip++
-				}
+				nSkip++
 			}
-		}
-
-		if exitReason != "" {
-			break
-		}
-
-		scannedCount += len(listResult.Items)
-		state["scanned_count"] = float64(scannedCount)
-
-		if len(rowsToUpsert) > 0 {
-			if _, err := database.UpsertGalleriesBulk(ctx, rowsToUpsert); err != nil {
-				return false, fmt.Errorf("upsert galleries: %w", err)
-			}
-			notify(grouperTrigger)
-		}
-
-		slog.Info(fmt.Sprintf("[INCR ] [%s] scanned=%d new=%d refresh=%d skip=%d",
-			name, scannedCount, nNew, nRefresh, nSkip))
-
-		progress := ClampProgress(float64(scannedCount) / float64(scanWindow) * 100)
-		_ = database.UpdateTaskRuntime(ctx, taskID,
-			db.WithState(state), db.WithProgress(progress),
-			db.WithStatus("running"), db.WithError(""))
-
-		// Check exit conditions
-		if listResult.NextCursor == nil {
-			exitReason = "END"
-		} else if scannedCount >= scanWindow {
-			exitReason = "WINDOW"
-		} else {
-			nextCursor = listResult.NextCursor
-			state["next_gid"] = *listResult.NextCursor
 		}
 	}
 
-	// Post-loop: reset state for next cycle
-	slog.Info(fmt.Sprintf("[INCR ] [%s] exit_reason=%s scanned=%d round=%d",
-		name, exitReason, scannedCount, roundNum))
-
-	if exitReason == "END" || exitReason == "WINDOW" {
-		state["next_gid"] = nil
-		state["round"] = float64(roundNum + 1)
-		state["scanned_count"] = float64(0)
-		state["latest_gid"] = nil
-		_ = database.UpdateTaskRuntime(ctx, taskID,
-			db.WithState(state), db.WithProgress(100),
-			db.WithStatus("running"), db.WithError(""), db.WithTouchRunTime())
-		return false, nil // continue next cycle
+	if banned {
+		slog.Warn("[INCR ] page interrupted by ban",
+			"name", name,
+			"new", nNew,
+			"refresh", nRefresh,
+			"skip", nSkip,
+		)
+		result.ExitReason = "BANNED"
+		return result, nil
 	}
 
-	// BANNED or ERROR — keep state for resumption
-	_ = database.UpdateTaskRuntime(ctx, taskID,
-		db.WithState(state), db.WithStatus("running"),
-		db.WithError(fmt.Sprintf("exit: %s", exitReason)))
-	return false, nil
+	scannedCount += len(listResult.Items)
+	checkpoint["scanned_count"] = float64(scannedCount)
+
+	if len(rowsToUpsert) > 0 {
+		if _, err := database.UpsertGalleriesBulk(ctx, rowsToUpsert); err != nil {
+			slog.Error("[INCR ] upsert failed",
+				"name", name,
+				"rows", len(rowsToUpsert),
+				"error", err,
+			)
+			return result, fmt.Errorf("upsert galleries: %w", err)
+		}
+		notify(grouperTrigger)
+	}
+
+	slog.Info("[INCR ] page summary",
+		"name", name,
+		"scanned_count", scannedCount,
+		"new", nNew,
+		"refresh", nRefresh,
+		"skip", nSkip,
+		"upserted", len(rowsToUpsert),
+	)
+
+	result.Pct = pctFor(scannedCount)
+
+	if listResult.NextCursor == nil {
+		slog.Info("[INCR ] page exit END: no next cursor", "name", name, "scanned_count", scannedCount)
+		result.ExitReason = "END"
+		return result, nil
+	}
+	if scannedCount >= scanWindow {
+		slog.Info("[INCR ] page exit WINDOW: hit scan_window",
+			"name", name,
+			"scanned_count", scannedCount,
+			"scan_window", scanWindow,
+		)
+		result.ExitReason = "WINDOW"
+		return result, nil
+	}
+
+	checkpoint["next_gid"] = *listResult.NextCursor
+	slog.Info("[INCR ] page continue, chain next",
+		"name", name,
+		"scanned_count", scannedCount,
+		"next_gid", *listResult.NextCursor,
+		"pct", result.Pct,
+	)
+	return result, nil
 }
 
 func parseCategories(cfg map[string]any) []string {
@@ -240,17 +347,15 @@ func parseCategories(cfg map[string]any) []string {
 }
 
 func shouldRefreshFromList(existing map[string]any, item *parser.GalleryListItem, threshold float64) bool {
-	// Check tag diff
 	existingTags, _ := existing["tags"].(map[string][]string)
 	detailTags := flattenTags(existingTags)
 	for _, tag := range item.VisibleTags {
 		tag = strings.ToLower(strings.TrimSpace(tag))
 		if tag != "" && !detailTags[tag] {
-			return true // missing tag
+			return true
 		}
 	}
 
-	// Check rating diff
 	existingRating, _ := existing["rating"].(*float64)
 	if existingRating == nil && item.RatingEst != nil {
 		return true

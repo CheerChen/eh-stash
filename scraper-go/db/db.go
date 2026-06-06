@@ -39,6 +39,10 @@ func (d *DB) Close() {
 	d.pool.Close()
 }
 
+func (d *DB) Pool() *pgxpool.Pool {
+	return d.pool
+}
+
 // GalleryRow represents a row to upsert into eh_galleries.
 type GalleryRow struct {
 	GID          int64
@@ -57,20 +61,6 @@ type GalleryRow struct {
 	Thumb        string
 	Tags         map[string][]string
 	IsActive     bool
-}
-
-type SyncTask struct {
-	ID            int
-	Name          string
-	Type          string
-	Category      string
-	DesiredStatus string
-	Status        string
-	Config        map[string]any
-	State         map[string]any
-	ProgressPct   float64
-	LastRunAt     *time.Time
-	ErrorMessage  *string
 }
 
 type ThumbQueueItem struct {
@@ -202,147 +192,6 @@ func (d *DB) UpsertGalleriesBulk(ctx context.Context, rows []GalleryRow) (int, e
 		return 0, err
 	}
 	return len(rows), nil
-}
-
-func (d *DB) ListSyncTasks(ctx context.Context) ([]SyncTask, error) {
-	rows, err := d.pool.Query(ctx, "SELECT id, name, type, category, desired_status, status, config, state, progress_pct, last_run_at, error_message FROM sync_tasks ORDER BY id ASC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tasks []SyncTask
-	for rows.Next() {
-		var t SyncTask
-		var cfgJSON, stateJSON []byte
-		err := rows.Scan(&t.ID, &t.Name, &t.Type, &t.Category, &t.DesiredStatus, &t.Status,
-			&cfgJSON, &stateJSON, &t.ProgressPct, &t.LastRunAt, &t.ErrorMessage)
-		if err != nil {
-			return nil, err
-		}
-		t.Config = make(map[string]any)
-		t.State = make(map[string]any)
-		_ = json.Unmarshal(cfgJSON, &t.Config)
-		_ = json.Unmarshal(stateJSON, &t.State)
-		tasks = append(tasks, t)
-	}
-	return tasks, rows.Err()
-}
-
-func (d *DB) GetTaskRuntime(ctx context.Context, taskID int) (*SyncTask, error) {
-	var t SyncTask
-	var cfgJSON, stateJSON []byte
-	err := d.pool.QueryRow(ctx,
-		`SELECT id, name, type, category, desired_status, status, config, state, progress_pct
-		 FROM sync_tasks WHERE id = $1`, taskID,
-	).Scan(&t.ID, &t.Name, &t.Type, &t.Category, &t.DesiredStatus, &t.Status,
-		&cfgJSON, &stateJSON, &t.ProgressPct)
-	if err == pgx.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	t.Config = make(map[string]any)
-	t.State = make(map[string]any)
-	_ = json.Unmarshal(cfgJSON, &t.Config)
-	_ = json.Unmarshal(stateJSON, &t.State)
-	return &t, nil
-}
-
-func (d *DB) UpdateTaskRuntime(ctx context.Context, taskID int, opts ...UpdateOption) error {
-	u := &updateOpts{}
-	for _, o := range opts {
-		o(u)
-	}
-
-	sets := []string{"updated_at = NOW()"}
-	args := []any{}
-	idx := 1
-
-	if u.state != nil {
-		stateJSON, _ := json.Marshal(u.state)
-		sets = append(sets, fmt.Sprintf("state = $%d", idx))
-		args = append(args, string(stateJSON))
-		idx++
-	}
-	if u.progressPct != nil {
-		sets = append(sets, fmt.Sprintf("progress_pct = $%d", idx))
-		args = append(args, *u.progressPct)
-		idx++
-	}
-	if u.status != nil {
-		sets = append(sets, fmt.Sprintf("status = $%d", idx))
-		args = append(args, *u.status)
-		idx++
-	}
-	if u.errorMessage != nil {
-		sets = append(sets, fmt.Sprintf("error_message = $%d", idx))
-		args = append(args, *u.errorMessage)
-		idx++
-	}
-	if u.touchRunTime {
-		sets = append(sets, "last_run_at = NOW()")
-	}
-
-	if len(sets) == 1 {
-		return nil // only updated_at
-	}
-
-	args = append(args, taskID)
-	sql := fmt.Sprintf("UPDATE sync_tasks SET %s WHERE id = $%d", strings.Join(sets, ", "), idx)
-	_, err := d.pool.Exec(ctx, sql, args...)
-	return err
-}
-
-type updateOpts struct {
-	state        map[string]any
-	progressPct  *float64
-	status       *string
-	errorMessage *string
-	touchRunTime bool
-}
-
-type UpdateOption func(*updateOpts)
-
-func WithState(s map[string]any) UpdateOption {
-	return func(o *updateOpts) { o.state = s }
-}
-
-func WithProgress(p float64) UpdateOption {
-	return func(o *updateOpts) { o.progressPct = &p }
-}
-
-func WithStatus(s string) UpdateOption {
-	return func(o *updateOpts) { o.status = &s }
-}
-
-func WithError(msg string) UpdateOption {
-	return func(o *updateOpts) { o.errorMessage = &msg }
-}
-
-func WithTouchRunTime() UpdateOption {
-	return func(o *updateOpts) { o.touchRunTime = true }
-}
-
-func (d *DB) SetTaskDesiredStatus(ctx context.Context, taskID int, desired string) error {
-	_, err := d.pool.Exec(ctx,
-		"UPDATE sync_tasks SET desired_status = $1, updated_at = NOW() WHERE id = $2",
-		desired, taskID)
-	return err
-}
-
-func (d *DB) ResetInterruptedStoppingTasks(ctx context.Context) (int64, error) {
-	tag, err := d.pool.Exec(ctx, `
-		UPDATE sync_tasks
-		SET status = 'stopped', updated_at = NOW()
-		WHERE status = 'running'
-		  AND desired_status = 'stopped'
-	`)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
 }
 
 func (d *DB) ClaimNextThumbQueueItem(ctx context.Context) (*ThumbQueueItem, error) {

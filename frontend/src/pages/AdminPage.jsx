@@ -23,6 +23,7 @@ import {
   updateThreshold,
   startTask,
   stopTask,
+  retryTask,
 } from '../api/admin';
 import { useCountUp } from '../hooks/useCountUp';
 import { useFocusTrap } from '../hooks/useFocusTrap';
@@ -79,49 +80,68 @@ function buildPayload(form) {
 }
 
 function isTransitioning(task) {
-  return (
-    (task.status === 'stopped' && task.desired_status === 'running')
-    || (task.status === 'running' && task.desired_status === 'stopped')
-  );
+  return Boolean(task.requested_action);
 }
 
 function getDisplayStatus(task) {
-  if (task.status === 'stopped' && task.desired_status === 'running') return 'starting';
-  if (task.status === 'running' && task.desired_status === 'stopped') return 'stopping';
-  if (task.type === 'favorites' && task.status === 'completed' && task.desired_status === 'running') return 'scheduled';
-  return task.status;
+  if (task.current_job_state) return task.current_job_state;
+  if (task.enabled && task.schedule_kind === 'periodic') return 'scheduled';
+  return task.latest_job_state || (task.enabled ? 'enabled' : 'disabled');
 }
 
-function formatTaskCategory(task) {
-  if (task.type === 'favorites') return 'Favorites';
-  if (task.type !== 'incremental') return task.category;
-  const categories = Array.isArray(task.config?.categories) ? task.config.categories : [];
-  if (!categories.length) return `${MIXED_CATEGORY}(0)`;
-  return `${MIXED_CATEGORY}(${categories.length}): ${categories.join(', ')}`;
+function formatTaskKind(value) {
+  if (value === 'gallery_sync') return 'Gallery Sync';
+  if (value === 'favorites_sync') return 'Favorites Sync';
+  return value || 'Sync Task';
+}
+
+function formatTaskScope(task) {
+  if (task.source === 'favorites') return 'source: favorites · scope: user_favorites';
+  if (task.strategy === 'incremental') {
+    const categories = Array.isArray(task.scope?.categories)
+      ? task.scope.categories
+      : (Array.isArray(task.config?.categories) ? task.config.categories : []);
+    return categories.length
+      ? `source: gallery_list · scope: ${categories.join(', ')}`
+      : 'source: gallery_list · scope: mixed categories';
+  }
+  return `source: gallery_list · scope: ${task.scope?.category || task.category || 'category'}`;
+}
+
+function formatTaskSchedule(task) {
+  if (task.schedule_kind === 'periodic') {
+    const seconds = Number(task.schedule_interval_sec || 0);
+    if (seconds >= 3600) return `periodic · every ${Math.round(seconds / 3600)}h`;
+    if (seconds > 0) return `periodic · every ${seconds}s`;
+    return 'periodic';
+  }
+  return 'manual';
 }
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
 const STATUS_CONFIG = {
-  starting: { text: 'text-cyan-300', ring: 'ring-cyan-500/30', bg: 'bg-cyan-500/10' },
-  running: { text: 'text-blue-400', ring: 'ring-blue-500/30', bg: 'bg-blue-500/10' },
-  stopping: { text: 'text-amber-300', ring: 'ring-amber-500/30', bg: 'bg-amber-500/10' },
-  stopped: { text: 'text-gray-400', ring: 'ring-gray-500/30', bg: 'bg-gray-500/10' },
-  completed: { text: 'text-emerald-400', ring: 'ring-emerald-500/30', bg: 'bg-emerald-500/10' },
+  available: { text: 'text-cyan-300', ring: 'ring-cyan-500/30', bg: 'bg-cyan-500/10' },
   scheduled: { text: 'text-cyan-400', ring: 'ring-cyan-500/30', bg: 'bg-cyan-500/10' },
-  error: { text: 'text-rose-400', ring: 'ring-rose-500/30', bg: 'bg-rose-500/10' },
+  running: { text: 'text-blue-400', ring: 'ring-blue-500/30', bg: 'bg-blue-500/10' },
+  retryable: { text: 'text-amber-300', ring: 'ring-amber-500/30', bg: 'bg-amber-500/10' },
+  completed: { text: 'text-emerald-400', ring: 'ring-emerald-500/30', bg: 'bg-emerald-500/10' },
+  cancelled: { text: 'text-gray-400', ring: 'ring-gray-500/30', bg: 'bg-gray-500/10' },
+  discarded: { text: 'text-rose-400', ring: 'ring-rose-500/30', bg: 'bg-rose-500/10' },
+  enabled: { text: 'text-sky-300', ring: 'ring-sky-500/30', bg: 'bg-sky-500/10' },
+  disabled: { text: 'text-gray-400', ring: 'ring-gray-500/30', bg: 'bg-gray-500/10' },
 };
 
 function StatusBadge({ status }) {
-  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.stopped;
-  const spinning = status === 'starting' || status === 'stopping';
+  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.disabled;
+  const spinning = status === 'available' || status === 'scheduled' || status === 'running' || status === 'retryable';
 
   return (
     <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ring-1 ${cfg.bg} ${cfg.text} ${cfg.ring}`}>
       {spinning ? (
         <Loader2 size={11} className="animate-spin" />
       ) : (
-        <span className={`w-1.5 h-1.5 rounded-full ${status === 'error' ? 'bg-rose-400' : status === 'completed' ? 'bg-emerald-400' : status === 'running' ? 'bg-blue-400' : 'bg-gray-400'}`} aria-hidden="true" />
+        <span className={`w-1.5 h-1.5 rounded-full ${status === 'discarded' ? 'bg-rose-400' : status === 'completed' ? 'bg-emerald-400' : status === 'enabled' ? 'bg-sky-400' : 'bg-gray-400'}`} aria-hidden="true" />
       )}
       {status}
     </span>
@@ -232,8 +252,10 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
   const [form, setForm] = useState({
     name: '', type: 'full', category: 'Cosplay', config: getDefaultConfig('full'),
   });
-  const hasIncrementalTask = (tasks || []).some((task) => task.type === 'incremental');
-  const hasFavoritesTask = (tasks || []).some((task) => task.type === 'favorites');
+  const hasIncrementalTask = (tasks || []).some((task) => (
+    task.source === 'gallery_list' && task.strategy === 'incremental'
+  ) || task.type === 'incremental');
+  const hasFavoritesSource = (tasks || []).some((task) => task.source === 'favorites' || task.type === 'favorites');
 
   const handleClose = useCallback(() => {
     if (!busy) onClose();
@@ -268,11 +290,11 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
     setErrorMsg('');
     if (!form.name.trim()) { setErrorMsg('名称不能为空'); return; }
     if (form.type === 'incremental' && hasIncrementalTask) {
-      setErrorMsg('仅允许创建一个 incremental 任务');
+      setErrorMsg('仅允许创建一个 gallery incremental sync');
       return;
     }
-    if (form.type === 'favorites' && hasFavoritesTask) {
-      setErrorMsg('仅允许创建一个 favorites 任务');
+    if (form.type === 'favorites' && hasFavoritesSource) {
+      setErrorMsg('仅允许创建一个 favorites source sync');
       return;
     }
     if (form.type === 'incremental' && (!Array.isArray(form.config.categories) || form.config.categories.length === 0)) {
@@ -334,9 +356,9 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
             value={form.type}
             onChange={(e) => handleTypeChange(e.target.value)}
             options={[
-              { label: 'Full Scan', value: 'full' },
-              { label: 'Incremental', value: 'incremental' },
-              { label: 'Favorites Sync', value: 'favorites' },
+              { label: 'Gallery Full Scan', value: 'full' },
+              { label: 'Gallery Incremental Sync', value: 'incremental' },
+              { label: 'Favorites Source Sync', value: 'favorites' },
             ]}
           />
           {form.type === 'full' ? (
@@ -366,7 +388,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
                   );
                 })}
               </div>
-              <p className="mt-1.5 text-xs text-gray-500">Incremental 使用 Mixed 模式，按上传活跃度抓取。</p>
+              <p className="mt-1.5 text-xs text-gray-500">Gallery incremental 使用 Mixed scope，按上传活跃度抓取。</p>
             </div>
           ) : null /* favorites: no category selector */}
 
@@ -413,12 +435,12 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
           </div>
           {form.type === 'incremental' && hasIncrementalTask && (
             <div role="alert" className="rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-sm text-amber-300">
-              已存在 incremental 任务。系统仅允许一个 incremental 任务。
+              已存在 gallery incremental sync。系统仅允许一个。
             </div>
           )}
-          {form.type === 'favorites' && hasFavoritesTask && (
+          {form.type === 'favorites' && hasFavoritesSource && (
             <div role="alert" className="rounded-lg bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-sm text-amber-300">
-              已存在 favorites 任务。系统仅允许一个 favorites 任务。
+              已存在 favorites source sync。系统仅允许一个。
             </div>
           )}
 
@@ -439,7 +461,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
           </button>
           <button
             onClick={handleSubmit}
-            disabled={busy || (form.type === 'incremental' && hasIncrementalTask) || (form.type === 'favorites' && hasFavoritesTask)}
+            disabled={busy || (form.type === 'incremental' && hasIncrementalTask) || (form.type === 'favorites' && hasFavoritesSource)}
             className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-all disabled:opacity-50 flex items-center gap-2"
           >
             {busy && <Loader2 size={14} className="animate-spin" />}
@@ -724,7 +746,7 @@ export default function AdminPage() {
   const tasksQuery = useQuery({
     queryKey: ['admin', 'tasks'],
     queryFn: getTasks,
-    refetchInterval: shouldPoll ? 5000 : false,
+    refetchInterval: false,
   });
 
   const thumbQuery = useQuery({
@@ -737,6 +759,18 @@ export default function AdminPage() {
 
   const tasks = tasksQuery.data || [];
   const stats = thumbQuery.data || { pending: 0, processing: 0, done: 0, waiting: 0 };
+
+  useEffect(() => {
+    if (!shouldPoll) return undefined;
+    const source = new EventSource('/api/v1/admin/events');
+    source.addEventListener('admin.task', () => {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
+    });
+    source.onerror = () => {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
+    };
+    return () => source.close();
+  }, [queryClient, shouldPoll]);
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['admin', 'tasks'] });
@@ -898,16 +932,16 @@ export default function AdminPage() {
           <div className="flex flex-col gap-3">
             {tasks.map((task) => {
               const progress = Number(task.progress_pct || 0);
-              const isIncremental = task.type === 'incremental';
-              const isFavorites = task.type === 'favorites';
+              const isIncremental = task.source === 'gallery_list' && task.strategy === 'incremental';
+              const isFavoritesSource = task.source === 'favorites';
               const dbCount = isIncremental
                 ? (task.state?.scanned_count ?? null)
-                : isFavorites
+                : isFavoritesSource
                   ? null
                   : (task.state?.db_count ?? null);
               const totalCount = isIncremental
                 ? (task.config?.scan_window ?? null)
-                : isFavorites
+                : isFavoritesSource
                   ? null
                   : (task.state?.total_count ?? null);
               const transition = isTransitioning(task);
@@ -915,11 +949,13 @@ export default function AdminPage() {
               const rowAction = pendingByTask[task.id];
               const rowBusy = Boolean(rowAction);
 
-              const canStart = !rowBusy && !transition && task.status !== 'running'
-                && (task.status !== 'completed' || task.type === 'favorites');
-              const canStop = !rowBusy && !transition && task.status === 'running';
-              const canDelete = !rowBusy && !transition && task.status !== 'running'
-                && (task.desired_status !== 'running' || (task.type === 'favorites' && task.status === 'completed'));
+              const activeStates = ['available', 'scheduled', 'running', 'retryable'];
+              const retryStates = ['cancelled', 'discarded', 'completed'];
+              const currentJobActive = activeStates.includes(task.current_job_state);
+              const canStart = !rowBusy && !transition && !task.enabled && !currentJobActive;
+              const canStop = !rowBusy && !transition && (task.enabled || currentJobActive);
+              const canRetry = !rowBusy && !transition && !currentJobActive && retryStates.includes(task.latest_job_state);
+              const canDelete = !rowBusy && !transition && !task.enabled && !currentJobActive;
 
               return (
                 <div
@@ -931,10 +967,21 @@ export default function AdminPage() {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-medium text-white text-sm">{task.name}</span>
-                        <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">{task.type}</span>
+                        <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">{formatTaskKind(task.task_kind)}</span>
+                        <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">{task.strategy || 'sync'}</span>
                         <StatusBadge status={displayStatus} />
+                        {transition && (
+                          <span className="text-xs font-mono text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded">
+                            request: {task.requested_action}
+                          </span>
+                        )}
                       </div>
-                      <p className="text-xs text-gray-500 mt-1">{formatTaskCategory(task)}</p>
+                      <p className="text-xs text-gray-500 mt-1">{formatTaskScope(task)} · {formatTaskSchedule(task)}</p>
+                      {(task.current_job_id || task.last_job_id) && (
+                        <p className="text-xs text-gray-600 mt-1 font-mono">
+                          current_job: {task.current_job_id ?? '-'} · last_job: {task.last_job_id ?? '-'}
+                        </p>
+                      )}
                       {task.error_message && (
                         <p className="text-xs text-rose-400 mt-1 truncate" title={task.error_message}>
                           {task.error_message}
@@ -961,6 +1008,16 @@ export default function AdminPage() {
                                    disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                       >
                         {rowAction === 'stop' ? <Loader2 size={15} className="animate-spin" /> : <Square size={15} />}
+                      </button>
+                      <button
+                        title="重试"
+                        aria-label={`重试任务 ${task.name}`}
+                        disabled={!canRetry}
+                        onClick={() => runTaskAction(task.id, 'retry', () => retryTask(task.id))}
+                        className="p-2 rounded-lg text-cyan-400 hover:bg-cyan-500/20 transition-all
+                                   disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                      >
+                        {rowAction === 'retry' ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
                       </button>
                       <button
                         title="删除"

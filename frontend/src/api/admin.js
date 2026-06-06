@@ -46,6 +46,12 @@ export function stopTask(id) {
   });
 }
 
+export function retryTask(id) {
+  return request(`/tasks/${id}/retry`, {
+    method: 'POST',
+  });
+}
+
 export function deleteTask(id, confirm = false) {
   return request(`/tasks/${id}?confirm=${confirm ? 'true' : 'false'}`, {
     method: 'DELETE',

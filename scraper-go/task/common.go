@@ -74,18 +74,16 @@ func CalcFCats(categories []string) int {
 	return AllCats - include
 }
 
-func ValidateFullTask(runtime *db.SyncTask) error {
-	if !ValidCategory(runtime.Category) {
-		return fmt.Errorf("category '%s' is not a valid ExHentai category", runtime.Category)
+func ValidateFullTask(def *db.TaskDef) error {
+	cat, _ := def.Scope["category"].(string)
+	if !ValidCategory(cat) {
+		return fmt.Errorf("category '%s' is not a valid ExHentai category", cat)
 	}
 	return nil
 }
 
-func ValidateIncrementalTask(runtime *db.SyncTask) error {
-	if runtime.Category != "Mixed" {
-		return fmt.Errorf("incremental task category must be 'Mixed', got '%s'", runtime.Category)
-	}
-	cats, ok := runtime.Config["categories"]
+func ValidateIncrementalTask(def *db.TaskDef) error {
+	cats, ok := def.Config["categories"]
 	if !ok {
 		return fmt.Errorf("incremental config.categories is required")
 	}
@@ -103,6 +101,16 @@ func ValidateIncrementalTask(runtime *db.SyncTask) error {
 		}
 	}
 	return nil
+}
+
+// cloneState returns a shallow copy of state so workers can mutate without
+// aliasing the caller's TaskDef.Checkpoint map.
+func cloneState(state map[string]any) map[string]any {
+	out := make(map[string]any, len(state)+4)
+	for k, v := range state {
+		out[k] = v
+	}
+	return out
 }
 
 func BuildListURL(baseURL string, categories []string, nextCursor *string) string {

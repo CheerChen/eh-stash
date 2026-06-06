@@ -1,11 +1,13 @@
 import json
 import math
+import time
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from db import get_db
+from db import get_cursor, get_db
 from models import (
     EmbeddingsStatus,
     FAVORITES_CATEGORY,
@@ -35,6 +37,70 @@ DEFAULT_INCREMENTAL_CONFIG = {
 DEFAULT_FAVORITES_CONFIG = {
     "run_interval_hours": 6,
 }
+
+TASK_DEF_BASE_SELECT = """
+    SELECT d.*,
+           {job_columns}
+    FROM sync_task_defs d
+    {job_joins}
+"""
+
+TASK_DEF_RIVER_COLUMNS = """
+           cj.state::text AS current_job_state,
+           cj.kind AS current_job_kind,
+           cj.attempt AS current_job_attempt,
+           cj.max_attempts AS current_job_max_attempts,
+           cj.scheduled_at AS current_job_scheduled_at,
+           cj.attempted_at AS current_job_attempted_at,
+           cj.finalized_at AS current_job_finalized_at,
+           lj.state::text AS latest_job_state,
+           lj.kind AS latest_job_kind,
+           lj.attempt AS latest_job_attempt,
+           lj.max_attempts AS latest_job_max_attempts,
+           lj.scheduled_at AS latest_job_scheduled_at,
+           lj.attempted_at AS latest_job_attempted_at,
+           lj.finalized_at AS latest_job_finalized_at
+"""
+
+TASK_DEF_NULL_JOB_COLUMNS = """
+           NULL::text AS current_job_state,
+           NULL::text AS current_job_kind,
+           NULL::integer AS current_job_attempt,
+           NULL::integer AS current_job_max_attempts,
+           NULL::timestamptz AS current_job_scheduled_at,
+           NULL::timestamptz AS current_job_attempted_at,
+           NULL::timestamptz AS current_job_finalized_at,
+           NULL::text AS latest_job_state,
+           NULL::text AS latest_job_kind,
+           NULL::integer AS latest_job_attempt,
+           NULL::integer AS latest_job_max_attempts,
+           NULL::timestamptz AS latest_job_scheduled_at,
+           NULL::timestamptz AS latest_job_attempted_at,
+           NULL::timestamptz AS latest_job_finalized_at
+"""
+
+TASK_DEF_RIVER_JOINS = """
+    LEFT JOIN river_job cj ON cj.id = d.current_job_id
+    LEFT JOIN river_job lj ON lj.id = d.last_job_id
+"""
+
+
+def _task_def_select(db) -> str:
+    db.execute("SELECT to_regclass('public.river_job')")
+    has_river_jobs = db.fetchone()[0] is not None
+    return TASK_DEF_BASE_SELECT.format(
+        job_columns=TASK_DEF_RIVER_COLUMNS if has_river_jobs else TASK_DEF_NULL_JOB_COLUMNS,
+        job_joins=TASK_DEF_RIVER_JOINS if has_river_jobs else "",
+    )
+
+
+def _sse(data: Dict[str, Any], event: str = "message", event_id: int | None = None) -> str:
+    lines = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event}")
+    lines.append(f"data: {json.dumps(data, default=str, ensure_ascii=False)}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _init_state(task_type: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -108,18 +174,121 @@ def _normalize_config(task_type: str, config: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def _task_from_row(db, row) -> SyncTask:
+def _legacy_status_for_job_state(job_state: str | None, enabled: bool) -> str:
+    if job_state in {"available", "pending", "scheduled", "running", "retryable"}:
+        return "running"
+    if job_state == "completed":
+        return "completed"
+    if job_state == "discarded":
+        return "error"
+    return "running" if enabled else "stopped"
+
+
+def _legacy_status_for_task(
+    current_job_state: str | None,
+    latest_job_state: str | None,
+    enabled: bool,
+    schedule_kind: str | None,
+) -> str:
+    if current_job_state:
+        return _legacy_status_for_job_state(current_job_state, enabled)
+    if enabled and schedule_kind == "periodic":
+        return "running"
+    return _legacy_status_for_job_state(latest_job_state, enabled)
+
+
+def _derive_type(source: str | None, strategy: str | None) -> str:
+    # Frontend still keys some UI off these legacy labels; derive them from the
+    # canonical source/strategy fields instead of storing duplicates.
+    if source == "favorites":
+        return "favorites"
+    if strategy == "incremental":
+        return "incremental"
+    return "full"
+
+
+def _derive_category(source: str | None, strategy: str | None, scope: Dict[str, Any]) -> str:
+    if source == "favorites":
+        return FAVORITES_CATEGORY
+    if strategy == "incremental":
+        return MIXED_CATEGORY
+    cat = scope.get("category")
+    return cat if isinstance(cat, str) else ""
+
+
+def _task_def_from_row(db, row) -> SyncTask:
     cols = [d[0] for d in db.description]
     item = dict(zip(cols, row))
-    return SyncTask(**item)
+    progress = dict(item.get("progress") or {})
+    checkpoint = dict(item.get("checkpoint") or {})
+    scope = dict(item.get("scope") or {})
+    enabled = bool(item.get("enabled"))
+    error = item.get("last_error")
+    source = item.get("source")
+    strategy = item.get("strategy")
+    current_job_state = item.get("current_job_state")
+    latest_job_state = item.get("latest_job_state")
+    schedule_kind = item.get("schedule_kind")
+
+    return SyncTask(
+        id=item["id"],
+        name=item["name"],
+        type=_derive_type(source, strategy),
+        category=_derive_category(source, strategy, scope),
+        status=_legacy_status_for_task(current_job_state, latest_job_state, enabled, schedule_kind),
+        desired_status="running" if enabled else "stopped",
+        config=item.get("config") or {},
+        state=checkpoint,
+        progress_pct=float(progress.get("pct") or 0),
+        created_at=item.get("created_at"),
+        updated_at=item.get("updated_at"),
+        last_run_at=item.get("last_run_at"),
+        error_message=error,
+        enabled=enabled,
+        task_kind=item.get("task_kind"),
+        source=source,
+        strategy=strategy,
+        scope=scope,
+        checkpoint=checkpoint,
+        progress=progress,
+        current_job_id=item.get("current_job_id"),
+        last_job_id=item.get("last_job_id"),
+        current_job_state=current_job_state,
+        current_job_kind=item.get("current_job_kind"),
+        current_job_attempt=item.get("current_job_attempt"),
+        current_job_max_attempts=item.get("current_job_max_attempts"),
+        current_job_scheduled_at=item.get("current_job_scheduled_at"),
+        current_job_attempted_at=item.get("current_job_attempted_at"),
+        current_job_finalized_at=item.get("current_job_finalized_at"),
+        latest_job_state=latest_job_state,
+        latest_job_kind=item.get("latest_job_kind"),
+        latest_job_attempt=item.get("latest_job_attempt"),
+        latest_job_max_attempts=item.get("latest_job_max_attempts"),
+        latest_job_scheduled_at=item.get("latest_job_scheduled_at"),
+        latest_job_attempted_at=item.get("latest_job_attempted_at"),
+        latest_job_finalized_at=item.get("latest_job_finalized_at"),
+        schedule_kind=schedule_kind,
+        schedule_interval_sec=item.get("schedule_interval_sec"),
+        next_run_at=item.get("next_run_at"),
+        last_finished_at=item.get("last_finished_at"),
+        requested_action=item.get("requested_action"),
+    )
 
 
-def _get_task_or_404(task_id: int, db) -> SyncTask:
-    db.execute("SELECT * FROM sync_tasks WHERE id = %s", (task_id,))
+def _get_task_def_or_404(task_id: int, db) -> SyncTask:
+    db.execute(_task_def_select(db) + " WHERE d.id = %s", (task_id,))
     row = db.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")
-    return _task_from_row(db, row)
+    return _task_def_from_row(db, row)
+
+
+def _get_task_or_404(task_id: int, db) -> SyncTask:
+    db.execute(_task_def_select(db) + " WHERE d.id = %s", (task_id,))
+    row = db.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_def_from_row(db, row)
 
 
 def _is_transitioning(task: SyncTask) -> bool:
@@ -134,7 +303,7 @@ def create_task(payload: SyncTaskCreate, db=Depends(get_db)):
     if payload.type == "incremental":
         if payload.category != MIXED_CATEGORY:
             raise HTTPException(status_code=422, detail=f"incremental category must be '{MIXED_CATEGORY}'")
-        db.execute("SELECT id, name FROM sync_tasks WHERE type = 'incremental' LIMIT 1")
+        db.execute("SELECT id, name FROM sync_task_defs WHERE source = 'gallery_list' AND strategy = 'incremental' LIMIT 1")
         existing = db.fetchone()
         if existing:
             raise HTTPException(
@@ -144,7 +313,7 @@ def create_task(payload: SyncTaskCreate, db=Depends(get_db)):
     elif payload.type == "favorites":
         if payload.category != FAVORITES_CATEGORY:
             raise HTTPException(status_code=422, detail=f"favorites category must be '{FAVORITES_CATEGORY}'")
-        db.execute("SELECT id, name FROM sync_tasks WHERE type = 'favorites' LIMIT 1")
+        db.execute("SELECT id, name FROM sync_task_defs WHERE source = 'favorites' LIMIT 1")
         existing = db.fetchone()
         if existing:
             raise HTTPException(
@@ -154,32 +323,55 @@ def create_task(payload: SyncTaskCreate, db=Depends(get_db)):
 
     cfg = _normalize_config(payload.type, payload.config)
     state = _init_state(payload.type, cfg)
+    progress = {"pct": 0}
+    task_kind = "favorites_sync" if payload.type == "favorites" else "gallery_sync"
+    source = "favorites" if payload.type == "favorites" else "gallery_list"
+    strategy = "incremental" if payload.type == "incremental" else "full"
+    if payload.type == "incremental":
+        scope = {"categories": cfg.get("categories", [])}
+    elif payload.type == "favorites":
+        scope = {"target": "user_favorites"}
+    else:
+        scope = {"category": payload.category}
+    schedule_kind = "periodic" if payload.type in {"favorites", "incremental"} else "manual"
+    interval_sec = None
+    enabled = payload.type in {"favorites", "incremental"}
+    if payload.type == "favorites":
+        interval_sec = int(float(cfg.get("run_interval_hours", 6)) * 3600)
+    elif payload.type == "incremental":
+        interval_sec = 30
 
     try:
         db.execute(
             """
-            INSERT INTO sync_tasks (name, type, category, config, state, status, desired_status, progress_pct)
-            VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, 'stopped', 'stopped', 0)
+            INSERT INTO sync_task_defs (
+                name, task_kind, source, strategy, scope,
+                enabled, config, checkpoint, progress, schedule_kind, schedule_interval_sec
+            )
+            VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s)
             RETURNING *
             """,
-            (payload.name, payload.type, payload.category, json.dumps(cfg), json.dumps(state)),
+            (
+                payload.name, task_kind, source, strategy, json.dumps(scope),
+                enabled, json.dumps(cfg), json.dumps(state),
+                json.dumps(progress), schedule_kind, interval_sec,
+            ),
         )
     except Exception as exc:
         msg = str(exc).lower()
-        if "duplicate key value" in msg and "sync_tasks_name_key" in msg:
+        if "duplicate key value" in msg and "sync_task_defs_name_key" in msg:
             raise HTTPException(status_code=409, detail="Task name already exists") from exc
         raise
 
     row = db.fetchone()
-    return _task_from_row(db, row)
+    return _task_def_from_row(db, row)
 
 
 @router.get("/tasks", response_model=list[SyncTask])
 def list_tasks(db=Depends(get_db)):
-    db.execute("SELECT * FROM sync_tasks ORDER BY id ASC")
+    db.execute(_task_def_select(db) + " ORDER BY d.id ASC")
     rows = db.fetchall()
-    cols = [d[0] for d in db.description]
-    return [SyncTask(**dict(zip(cols, row))) for row in rows]
+    return [_task_def_from_row(db, row) for row in rows]
 
 
 @router.get("/tasks/{task_id}", response_model=SyncTask)
@@ -187,14 +379,56 @@ def get_task(task_id: int, db=Depends(get_db)):
     return _get_task_or_404(task_id, db)
 
 
+@router.get("/events")
+def admin_events(after_id: int = Query(0, ge=0)):
+    def stream():
+        last_id = after_id
+        while True:
+            emitted = False
+            with get_cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, task_id, job_id, event_type, message, payload, created_at
+                    FROM sync_task_events
+                    WHERE id > %s
+                    ORDER BY id ASC
+                    LIMIT 100
+                    """,
+                    (last_id,),
+                )
+                for row in cur.fetchall():
+                    event_id, task_id, job_id, event_type, message, payload, created_at = row
+                    last_id = event_id
+                    emitted = True
+                    yield _sse(
+                        {
+                            "id": event_id,
+                            "task_id": task_id,
+                            "job_id": job_id,
+                            "type": event_type,
+                            "message": message,
+                            "payload": payload or {},
+                            "created_at": created_at,
+                        },
+                        event="admin.task",
+                        event_id=event_id,
+                    )
+            if not emitted:
+                yield _sse({"ts": time.time()}, event="ping")
+            time.sleep(5)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 @router.patch("/tasks/{task_id}", response_model=SyncTask)
 def patch_task(task_id: int, payload: SyncTaskUpdate, db=Depends(get_db)):
-    db.execute("SELECT id, name, type, config FROM sync_tasks WHERE id = %s", (task_id,))
+    db.execute("SELECT id, name, source, strategy, config FROM sync_task_defs WHERE id = %s", (task_id,))
     row = db.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    _, curr_name, task_type, curr_config = row
+    _, curr_name, source, strategy, curr_config = row
+    task_type = _derive_type(source, strategy)
     name = payload.name if payload.name is not None else curr_name
     config = dict(curr_config or {})
     if payload.config:
@@ -204,7 +438,7 @@ def patch_task(task_id: int, payload: SyncTaskUpdate, db=Depends(get_db)):
     try:
         db.execute(
             """
-            UPDATE sync_tasks
+            UPDATE sync_task_defs
             SET name = %s, config = %s::jsonb, updated_at = NOW()
             WHERE id = %s
             RETURNING *
@@ -213,45 +447,76 @@ def patch_task(task_id: int, payload: SyncTaskUpdate, db=Depends(get_db)):
         )
     except Exception as exc:
         msg = str(exc).lower()
-        if "duplicate key value" in msg and "sync_tasks_name_key" in msg:
+        if "duplicate key value" in msg and "sync_task_defs_name_key" in msg:
             raise HTTPException(status_code=409, detail="Task name already exists") from exc
         raise
 
-    return _task_from_row(db, db.fetchone())
+    db.execute(_task_def_select(db) + " WHERE d.id = %s", (task_id,))
+    return _task_def_from_row(db, db.fetchone())
 
 
 @router.post("/tasks/{task_id}/start", response_model=SyncTask)
 def start_task(task_id: int, db=Depends(get_db)):
     task = _get_task_or_404(task_id, db)
-    if task.status == "completed" and task.type != "favorites":
-        raise HTTPException(status_code=409, detail="Completed task cannot be started")
-    if task.desired_status == "running":
+    if task.current_job_state in {"available", "pending", "scheduled", "running", "retryable"}:
         return task
-    if _is_transitioning(task):
-        raise HTTPException(status_code=409, detail="Task transition in progress")
 
     db.execute(
-        "UPDATE sync_tasks SET desired_status = 'running', updated_at = NOW() WHERE id = %s RETURNING *",
+        """
+        UPDATE sync_task_defs
+        SET enabled = TRUE,
+            requested_action = 'start',
+            requested_at = NOW(),
+            updated_at = NOW()
+        WHERE id = %s
+        RETURNING *
+        """,
         (task_id,),
     )
     row = db.fetchone()
-    return _task_from_row(db, row)
+    return _task_def_from_row(db, row)
 
 
 @router.post("/tasks/{task_id}/stop", response_model=SyncTask)
 def stop_task(task_id: int, db=Depends(get_db)):
     task = _get_task_or_404(task_id, db)
-    if task.desired_status == "stopped":
+    if not task.enabled and task.current_job_state not in {"available", "pending", "scheduled", "running", "retryable"}:
         return task
-    if _is_transitioning(task):
-        raise HTTPException(status_code=409, detail="Task transition in progress")
 
     db.execute(
-        "UPDATE sync_tasks SET desired_status = 'stopped', updated_at = NOW() WHERE id = %s RETURNING *",
+        """
+        UPDATE sync_task_defs
+        SET enabled = FALSE,
+            requested_action = 'stop',
+            requested_at = NOW(),
+            updated_at = NOW()
+        WHERE id = %s
+        RETURNING *
+        """,
         (task_id,),
     )
     row = db.fetchone()
-    return _task_from_row(db, row)
+    return _task_def_from_row(db, row)
+
+
+@router.post("/tasks/{task_id}/retry", response_model=SyncTask)
+def retry_task(task_id: int, db=Depends(get_db)):
+    task = _get_task_or_404(task_id, db)
+    if task.current_job_state in {"available", "pending", "scheduled", "running", "retryable"}:
+        raise HTTPException(status_code=409, detail="Task is already active")
+    db.execute(
+        """
+        UPDATE sync_task_defs
+        SET enabled = TRUE,
+            requested_action = 'retry',
+            requested_at = NOW(),
+            updated_at = NOW()
+        WHERE id = %s
+        RETURNING *
+        """,
+        (task_id,),
+    )
+    return _task_def_from_row(db, db.fetchone())
 
 
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -260,14 +525,10 @@ def delete_task(task_id: int, confirm: bool = Query(False), db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="Delete requires confirm=true")
 
     task = _get_task_or_404(task_id, db)
-    if task.status == "running" or task.desired_status == "running":
-        # Allow deleting favorites tasks in scheduled state (completed but desired=running)
-        if not (task.type == "favorites" and task.status == "completed"):
-            raise HTTPException(status_code=409, detail="Stop task before deleting")
-    if _is_transitioning(task):
-        raise HTTPException(status_code=409, detail="Task transition in progress")
+    if task.current_job_state in {"available", "pending", "scheduled", "running", "retryable"} or task.enabled:
+        raise HTTPException(status_code=409, detail="Stop task before deleting")
 
-    db.execute("DELETE FROM sync_tasks WHERE id = %s RETURNING id", (task_id,))
+    db.execute("DELETE FROM sync_task_defs WHERE id = %s RETURNING id", (task_id,))
     row = db.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found")

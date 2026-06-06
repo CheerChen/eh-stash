@@ -113,6 +113,34 @@ class SyncTask(BaseModel):
     updated_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    enabled: Optional[bool] = None
+    task_kind: Optional[str] = None
+    source: Optional[str] = None
+    strategy: Optional[str] = None
+    scope: Optional[Dict[str, Any]] = None
+    checkpoint: Optional[Dict[str, Any]] = None
+    progress: Optional[Dict[str, Any]] = None
+    current_job_id: Optional[int] = None
+    last_job_id: Optional[int] = None
+    current_job_state: Optional[str] = None
+    current_job_kind: Optional[str] = None
+    current_job_attempt: Optional[int] = None
+    current_job_max_attempts: Optional[int] = None
+    current_job_scheduled_at: Optional[datetime] = None
+    current_job_attempted_at: Optional[datetime] = None
+    current_job_finalized_at: Optional[datetime] = None
+    latest_job_state: Optional[str] = None
+    latest_job_kind: Optional[str] = None
+    latest_job_attempt: Optional[int] = None
+    latest_job_max_attempts: Optional[int] = None
+    latest_job_scheduled_at: Optional[datetime] = None
+    latest_job_attempted_at: Optional[datetime] = None
+    latest_job_finalized_at: Optional[datetime] = None
+    schedule_kind: Optional[str] = None
+    schedule_interval_sec: Optional[int] = None
+    next_run_at: Optional[datetime] = None
+    last_finished_at: Optional[datetime] = None
+    requested_action: Optional[str] = None
 
 
 class ThumbQueueStats(BaseModel):

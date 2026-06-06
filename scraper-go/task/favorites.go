@@ -11,54 +11,36 @@ import (
 	"github.com/CheerChen/eh-stash/scraper-go/parser"
 )
 
-// RunFavoritesOnce runs the favorites sync task.
+// RunFavoritesOnce runs one round of the favorites sync task. Stop is signaled
+// via ctx cancellation; state is persisted to sync_task_defs.checkpoint.
 func RunFavoritesOnce(
 	ctx context.Context,
 	database *db.DB,
 	httpClient *client.Client,
 	cfg *config.Config,
-	taskID int,
-	runtime *db.SyncTask,
+	def *db.TaskDef,
 	signals *FavSignals,
-) (bool, error) {
-	name := runtime.Name
+) error {
+	name := def.Name
+	taskID := def.ID
 
-	state := make(map[string]any)
-	for k, v := range runtime.State {
-		state[k] = v
-	}
+	checkpoint := cloneState(def.Checkpoint)
 
-	roundNum := getStateInt(state, "round")
-	nextCursor := getStateString(state, "next_gid")
+	roundNum := getStateInt(checkpoint, "round")
+	nextCursor := getStateString(checkpoint, "next_gid")
 	isResuming := nextCursor != nil
 
 	var collectedGIDs []int64
 	failedGIDs := make(map[int64]bool)
-	hasNewFavorites := false // track if any page had new favorites
+	hasNewFavorites := false
 
 	for {
 		select {
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 
-		// Check desired_status
-		rt, err := database.GetTaskRuntime(ctx, taskID)
-		if err != nil {
-			return false, err
-		}
-		if rt == nil || rt.DesiredStatus != "running" {
-			state["next_gid"] = nil
-			if nextCursor != nil {
-				state["next_gid"] = *nextCursor
-			}
-			_ = database.UpdateTaskRuntime(ctx, taskID,
-				db.WithState(state), db.WithStatus("stopped"), db.WithTouchRunTime())
-			return true, nil
-		}
-
-		// Fetch favorites page
 		favURL := cfg.ExBaseURL + "/favorites.php?inline_set=dm_e"
 		if nextCursor != nil {
 			favURL += "&next=" + *nextCursor
@@ -68,40 +50,33 @@ func RunFavoritesOnce(
 		if err != nil {
 			slog.Warn(fmt.Sprintf("[FAV  ] [%s] fetch failed", name), "error", err)
 			if nextCursor != nil {
-				state["next_gid"] = *nextCursor
+				checkpoint["next_gid"] = *nextCursor
 			}
-			_ = database.UpdateTaskRuntime(ctx, taskID,
-				db.WithState(state), db.WithStatus("running"), db.WithError("fetch failed"))
-			return false, nil
+			return database.UpdateTaskDefCheckpoint(ctx, taskID, checkpoint, 0, "fetch failed", false)
 		}
 		if result == client.ResultBanned {
 			slog.Warn(fmt.Sprintf("[FAV  ] [%s] IP banned", name))
 			if nextCursor != nil {
-				state["next_gid"] = *nextCursor
+				checkpoint["next_gid"] = *nextCursor
 			}
-			_ = database.UpdateTaskRuntime(ctx, taskID,
-				db.WithState(state), db.WithStatus("running"),
-				db.WithError("IP temporarily banned"))
-			return false, nil
+			return database.UpdateTaskDefCheckpoint(ctx, taskID, checkpoint, 0, "IP temporarily banned", false)
 		}
 
 		listResult, err := parser.ParseGalleryList(body)
 		if err != nil {
 			slog.Error(fmt.Sprintf("[FAV  ] [%s] parse failed", name), "error", err)
-			return false, nil
+			return nil
 		}
 
 		if len(listResult.Items) == 0 {
-			break // no more pages
+			break
 		}
 
-		// Collect GIDs from this page
 		var pageGIDs []int64
 		for _, item := range listResult.Items {
 			pageGIDs = append(pageGIDs, item.GID)
 		}
 
-		// Backfill missing galleries
 		nonExisting, err := database.GetNonExistingGIDs(ctx, pageGIDs)
 		if err != nil {
 			slog.Error(fmt.Sprintf("[FAV  ] [%s] get non-existing GIDs failed", name), "error", err)
@@ -113,7 +88,6 @@ func RunFavoritesOnce(
 				if failedGIDs[gid] {
 					continue
 				}
-				// Find token for this GID
 				var token string
 				for _, item := range listResult.Items {
 					if item.GID == gid {
@@ -130,12 +104,9 @@ func RunFavoritesOnce(
 				if err != nil || detailResult != client.ResultOK {
 					if detailResult == client.ResultBanned {
 						if nextCursor != nil {
-							state["next_gid"] = *nextCursor
+							checkpoint["next_gid"] = *nextCursor
 						}
-						_ = database.UpdateTaskRuntime(ctx, taskID,
-							db.WithState(state), db.WithStatus("running"),
-							db.WithError("IP temporarily banned"))
-						return false, nil
+						return database.UpdateTaskDefCheckpoint(ctx, taskID, checkpoint, 0, "IP temporarily banned", false)
 					}
 					failedGIDs[gid] = true
 					continue
@@ -147,7 +118,6 @@ func RunFavoritesOnce(
 					continue
 				}
 
-				// Check if deleted
 				isActive := true
 				for _, item := range listResult.Items {
 					if item.GID == gid && item.IsDeleted {
@@ -169,14 +139,12 @@ func RunFavoritesOnce(
 			slog.Info(fmt.Sprintf("[FAV  ] [%s] backfilled %d missing galleries", name, len(rowsToUpsert)))
 		}
 
-		// Mark deleted existing galleries
 		for _, item := range listResult.Items {
 			if item.IsDeleted {
 				_ = database.MarkGalleryInactive(ctx, item.GID)
 			}
 		}
 
-		// Upsert favorites
 		var favRows []db.FavoriteRow
 		for _, item := range listResult.Items {
 			favRows = append(favRows, db.FavoriteRow{
@@ -196,13 +164,9 @@ func RunFavoritesOnce(
 
 		collectedGIDs = append(collectedGIDs, pageGIDs...)
 
-		// Advance cursor
-		_ = database.UpdateTaskRuntime(ctx, taskID,
-			db.WithStatus("running"), db.WithError(""),
-			db.WithState(map[string]any{
-				"next_gid": listResult.NextCursor,
-				"round":    float64(roundNum),
-			}))
+		checkpoint["next_gid"] = listResult.NextCursor
+		checkpoint["round"] = float64(roundNum)
+		_ = database.UpdateTaskDefCheckpoint(ctx, taskID, checkpoint, 0, "", false)
 
 		if listResult.NextCursor == nil {
 			break
@@ -211,7 +175,6 @@ func RunFavoritesOnce(
 		nextCursor = &cursor
 	}
 
-	// Full traversal completed
 	hasRemovedFavorites := false
 	if !isResuming && len(collectedGIDs) > 0 {
 		removed, err := database.CleanupStaleFavorites(ctx, collectedGIDs)
@@ -223,7 +186,6 @@ func RunFavoritesOnce(
 		}
 	}
 
-	// Signal embeddings worker to recompute user_profile when favorites changed.
 	if hasNewFavorites || hasRemovedFavorites {
 		notify(signals.ProfileUpdate)
 		slog.Info(fmt.Sprintf("[FAV  ] [%s] favorites changed, profile update signaled", name))
@@ -234,15 +196,7 @@ func RunFavoritesOnce(
 	slog.Info(fmt.Sprintf("[FAV  ] [%s] completed round=%d, total=%d favorites",
 		name, roundNum+1, len(collectedGIDs)))
 
-	_ = database.UpdateTaskRuntime(ctx, taskID,
-		db.WithState(map[string]any{
-			"next_gid": nil,
-			"round":    float64(roundNum + 1),
-		}),
-		db.WithStatus("completed"),
-		db.WithProgress(100.0),
-		db.WithError(""),
-		db.WithTouchRunTime(),
-	)
-	return true, nil
+	checkpoint["next_gid"] = nil
+	checkpoint["round"] = float64(roundNum + 1)
+	return database.UpdateTaskDefCheckpoint(ctx, taskID, checkpoint, 100, "", true)
 }
