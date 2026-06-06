@@ -1,5 +1,5 @@
--- 009_pi_sync.sql
--- Pi → Neon + R2 sync infrastructure (pi-sync container).
+-- 004_pi_sync.sql
+-- Pi -> Neon + R2 sync infrastructure (pi-sync container).
 --
 -- sync_state:
 --   Single-row table. cursor_gid drives the rotating backfill chunk; once a

@@ -43,7 +43,6 @@ class Stats(BaseModel):
     total_galleries: int
     by_category: Dict[str, int]
     last_synced_at: Optional[datetime] = None
-    queue_status: Dict[str, Any]
 
 
 class SyncTaskCreate(BaseModel):
