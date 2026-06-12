@@ -312,6 +312,9 @@ func (s *Scheduler) runRiverManager(ctx context.Context, riverClient *river.Clie
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if s.egress != nil {
+				s.egress.Reconcile(ctx)
+			}
 			s.handleRequestedActions(ctx, riverClient)
 		}
 	}

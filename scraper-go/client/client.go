@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/CheerChen/eh-stash/scraper-go/config"
+	"github.com/CheerChen/eh-stash/scraper-go/egress"
 	"github.com/CheerChen/eh-stash/scraper-go/ratelimit"
 	utls "github.com/refraction-networking/utls"
 )
@@ -28,18 +30,20 @@ var banRE = regexp.MustCompile(
 //
 // http      — uTLS-fingerprinted, used for exhentai.org main site (anti-CF).
 // thumbHTTP — standard TLS, keep-alive enabled, used for the s.exhentai.org
-//             CDN. Thumbs don't need fingerprint mimicry and the CDN throttles
-//             concurrent TLS handshakes; one persistent connection per process
-//             amortizes the handshake cost to ~0.
+//
+//	CDN. Thumbs don't need fingerprint mimicry and the CDN throttles
+//	concurrent TLS handshakes; one persistent connection per process
+//	amortizes the handshake cost to ~0.
 type Client struct {
 	http      *http.Client
 	thumbHTTP *http.Client
 	cfg       *config.Config
+	egress    *egress.Manager
 	limiter   *ratelimit.Limiter
 }
 
 // New creates a Client with uTLS Chrome fingerprint and optional proxy.
-func New(cfg *config.Config, limiter *ratelimit.Limiter) (*Client, error) {
+func New(cfg *config.Config, limiter *ratelimit.Limiter, egressMgr *egress.Manager) (*Client, error) {
 	jar, _ := cookiejar.New(nil)
 
 	// Set cookies for the base URL
@@ -53,7 +57,12 @@ func New(cfg *config.Config, limiter *ratelimit.Limiter) (*Client, error) {
 	}
 	jar.SetCookies(baseURL, cookies)
 
-	transport := newUTLSTransport(cfg.ProxyURL)
+	transport := newUTLSTransport(func() string {
+		if egressMgr == nil {
+			return cfg.ProxyURL
+		}
+		return egressMgr.CurrentProxyURL()
+	})
 
 	httpClient := &http.Client{
 		Jar:       jar,
@@ -82,6 +91,7 @@ func New(cfg *config.Config, limiter *ratelimit.Limiter) (*Client, error) {
 		http:      httpClient,
 		thumbHTTP: thumbHTTP,
 		cfg:       cfg,
+		egress:    egressMgr,
 		limiter:   limiter,
 	}, nil
 }
@@ -105,6 +115,29 @@ const (
 // FetchPage fetches a page with rate limiting and ban detection.
 // Returns (body, resultType, error).
 func (c *Client) FetchPage(ctx context.Context, pageURL string) (string, string, error) {
+	mode := c.currentMode()
+	body, result, err := c.fetchPageWithMode(ctx, pageURL, mode, true)
+	return body, result, err
+}
+
+func (c *Client) ProbeAccess(ctx context.Context, mode egress.Mode) error {
+	body, result, err := c.fetchPageWithMode(ctx, c.cfg.ExBaseURL, mode, false)
+	if err != nil {
+		return err
+	}
+	if result == ResultBanned {
+		return fmt.Errorf("IP is currently banned")
+	}
+	if strings.Contains(body, "Sad Panda") {
+		return fmt.Errorf("sad panda - check cookies")
+	}
+	if !strings.Contains(body, "front_page") && !strings.Contains(body, "itg") {
+		return fmt.Errorf("unexpected probe response")
+	}
+	return nil
+}
+
+func (c *Client) fetchPageWithMode(ctx context.Context, pageURL string, mode egress.Mode, report bool) (string, string, error) {
 	if err := c.limiter.Acquire(ctx); err != nil {
 		return "", ResultError, err
 	}
@@ -119,9 +152,13 @@ func (c *Client) FetchPage(ctx context.Context, pageURL string) (string, string,
 		}
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, mode)
 	if err != nil {
-		return "", ResultError, fmt.Errorf("HTTP GET %s: %w", pageURL, err)
+		wrapped := fmt.Errorf("HTTP GET %s: %w", pageURL, err)
+		if report {
+			c.reportFailure(mode, classifyErr(wrapped), wrapped)
+		}
+		return "", ResultError, wrapped
 	}
 	defer resp.Body.Close()
 
@@ -135,18 +172,36 @@ func (c *Client) FetchPage(ctx context.Context, pageURL string) (string, string,
 	if strings.Contains(body, "temporarily banned") || strings.Contains(body, "IP address has been") {
 		secs := parseBanSeconds(body)
 		c.limiter.SetBan(time.Duration(secs) * time.Second)
+		if report {
+			c.reportFailure(mode, egress.ErrKindBan, nil)
+		}
 		return "", ResultBanned, nil
 	}
 
 	// Sad Panda / blank page
 	if resp.StatusCode == 200 && len(body) < 100 && !strings.Contains(body, "<") {
-		return "", ResultError, fmt.Errorf("sad panda or blank response")
+		err := fmt.Errorf("sad panda or blank response")
+		if report {
+			c.reportFailure(mode, egress.ErrKindParse, err)
+		}
+		return "", ResultError, err
 	}
 
 	if resp.StatusCode != 200 {
-		return "", ResultError, fmt.Errorf("HTTP %d from %s", resp.StatusCode, pageURL)
+		err := fmt.Errorf("HTTP %d from %s", resp.StatusCode, pageURL)
+		if report {
+			kind := egress.ErrKindHTTPStatus
+			if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+				kind = egress.ErrKindAuth
+			}
+			c.reportFailure(mode, kind, err)
+		}
+		return "", ResultError, err
 	}
 
+	if report {
+		c.reportSuccess(mode)
+	}
 	return body, ResultOK, nil
 }
 
@@ -197,7 +252,7 @@ func parseBanSeconds(text string) int {
 
 // ValidateAccess checks that the client can access ExHentai.
 func (c *Client) ValidateAccess(ctx context.Context) error {
-	body, result, err := c.FetchPage(ctx, c.cfg.ExBaseURL)
+	body, result, err := c.fetchPageWithMode(ctx, c.cfg.ExBaseURL, c.currentMode(), false)
 	if err != nil {
 		return fmt.Errorf("validate access: %w", err)
 	}
@@ -214,7 +269,7 @@ func (c *Client) ValidateAccess(ctx context.Context) error {
 }
 
 // newUTLSTransport creates an http.Transport that uses uTLS for Chrome TLS fingerprinting.
-func newUTLSTransport(proxyURL string) http.RoundTripper {
+func newUTLSTransport(proxyURL func() string) http.RoundTripper {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 
 	return &utlsTransport{
@@ -225,7 +280,7 @@ func newUTLSTransport(proxyURL string) http.RoundTripper {
 
 type utlsTransport struct {
 	dialer   *net.Dialer
-	proxyURL string
+	proxyURL func() string
 }
 
 func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -249,8 +304,12 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var rawConn net.Conn
 	var err error
 
-	if t.proxyURL != "" {
-		rawConn, err = dialViaProxy(t.proxyURL, addr, t.dialer)
+	proxyURL := ""
+	if t.proxyURL != nil {
+		proxyURL = t.proxyURL()
+	}
+	if proxyURL != "" {
+		rawConn, err = dialViaProxy(proxyURL, addr, t.dialer)
 	} else {
 		rawConn, err = t.dialer.DialContext(req.Context(), "tcp", addr)
 	}
@@ -342,4 +401,66 @@ func dialViaProxy(proxyURLStr, target string, dialer *net.Dialer) (net.Conn, err
 	}
 
 	return conn, nil
+}
+
+func (c *Client) currentMode() egress.Mode {
+	if c.egress == nil {
+		if c.cfg.ProxyURL == "" {
+			return egress.ModeDirect
+		}
+		return egress.ModeProxy
+	}
+	return c.egress.CurrentMode()
+}
+
+func (c *Client) do(req *http.Request, mode egress.Mode) (*http.Response, error) {
+	if mode == c.currentMode() {
+		return c.http.Do(req)
+	}
+
+	clone := req.Clone(req.Context())
+	tr := newUTLSTransport(func() string {
+		if mode == egress.ModeProxy {
+			return c.cfg.ProxyURL
+		}
+		return ""
+	})
+	client := &http.Client{
+		Jar:       c.http.Jar,
+		Timeout:   c.http.Timeout,
+		Transport: tr,
+	}
+	return client.Do(clone)
+}
+
+func (c *Client) reportSuccess(mode egress.Mode) {
+	if c.egress != nil {
+		c.egress.ReportSuccess(mode)
+	}
+}
+
+func (c *Client) reportFailure(mode egress.Mode, kind egress.ErrKind, err error) {
+	if c.egress != nil {
+		c.egress.ReportFailure(mode, kind, err)
+	}
+}
+
+func classifyErr(err error) egress.ErrKind {
+	if err == nil {
+		return egress.ErrKindNone
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return egress.ErrKindTimeout
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "proxy connect failed"), strings.Contains(msg, "dial proxy"), strings.Contains(msg, "connect failed"):
+		return egress.ErrKindProxyConnect
+	case strings.Contains(msg, "tls handshake"), strings.Contains(msg, "ssl"), strings.Contains(msg, "x509"), strings.Contains(msg, "eof"):
+		return egress.ErrKindTLSHandshake
+	case strings.Contains(msg, "timeout"):
+		return egress.ErrKindTimeout
+	default:
+		return egress.ErrKindParse
+	}
 }

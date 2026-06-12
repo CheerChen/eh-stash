@@ -9,6 +9,7 @@ import (
 	"github.com/CheerChen/eh-stash/scraper-go/client"
 	"github.com/CheerChen/eh-stash/scraper-go/config"
 	"github.com/CheerChen/eh-stash/scraper-go/db"
+	"github.com/CheerChen/eh-stash/scraper-go/egress"
 	"github.com/CheerChen/eh-stash/scraper-go/ratelimit"
 )
 
@@ -23,6 +24,7 @@ type Scheduler struct {
 	db           *db.DB
 	client       *client.Client
 	cfg          *config.Config
+	egress       *egress.Manager
 	mainLimiter  *ratelimit.Limiter
 	thumbLimiter *ratelimit.SimpleLimiter
 	signals      *Signals
@@ -33,6 +35,7 @@ func New(
 	database *db.DB,
 	httpClient *client.Client,
 	cfg *config.Config,
+	egressMgr *egress.Manager,
 	mainLimiter *ratelimit.Limiter,
 	thumbLimiter *ratelimit.SimpleLimiter,
 	signals *Signals,
@@ -41,6 +44,7 @@ func New(
 		db:           database,
 		client:       httpClient,
 		cfg:          cfg,
+		egress:       egressMgr,
 		mainLimiter:  mainLimiter,
 		thumbLimiter: thumbLimiter,
 		signals:      signals,

@@ -14,6 +14,7 @@ import (
 	"github.com/CheerChen/eh-stash/scraper-go/client"
 	"github.com/CheerChen/eh-stash/scraper-go/config"
 	"github.com/CheerChen/eh-stash/scraper-go/db"
+	"github.com/CheerChen/eh-stash/scraper-go/egress"
 	"github.com/CheerChen/eh-stash/scraper-go/ratelimit"
 	"github.com/CheerChen/eh-stash/scraper-go/scheduler"
 )
@@ -65,20 +66,19 @@ func main() {
 		time.Duration(cfg.ThumbRateInterval * float64(time.Second)),
 	)
 
+	egressMgr := egress.New(egress.Config{
+		ProxyURL: cfg.ProxyURL,
+	})
+
 	// HTTP client
-	httpClient, err := client.New(cfg, mainLimiter)
+	httpClient, err := client.New(cfg, mainLimiter, egressMgr)
 	if err != nil {
 		slog.Error("HTTP client init failed", "error", err)
 		os.Exit(1)
 	}
-
-	// Validate access
-	slog.Info("validating ExHentai access...")
-	if err := httpClient.ValidateAccess(ctx); err != nil {
-		slog.Error("access validation failed", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("access check passed")
+	egressMgr.SetProber(func(ctx context.Context, mode egress.Mode) error {
+		return httpClient.ProbeAccess(ctx, mode)
+	})
 
 	// Signal channels for workers
 	signals := &scheduler.Signals{
@@ -90,7 +90,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	// Start scheduler
-	sched := scheduler.New(database, httpClient, cfg, mainLimiter, thumbLimiter, signals)
+	sched := scheduler.New(database, httpClient, cfg, egressMgr, mainLimiter, thumbLimiter, signals)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
