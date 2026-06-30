@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useReducer } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Loader2,
@@ -31,7 +31,6 @@ import {
   retryTask,
 } from '../api/admin';
 import { useCountUp } from '../hooks/useCountUp';
-import { useFocusTrap } from '../hooks/useFocusTrap';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -257,15 +256,14 @@ function GradientProgressBar({ progress, dbCount, totalCount }) {
         </span>
         <span className="text-xs font-semibold text-white ml-2">{displayPct}%</span>
       </div>
-      <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden" role="progressbar" aria-valuenow={clampedPct} aria-valuemin={0} aria-valuemax={100}>
-        <div
-          className="h-full rounded-full transition-all duration-700 ease-out"
-          style={{
-            width: `${clampedPct}%`,
-            background: 'linear-gradient(90deg, #3b82f6 0%, #10b981 100%)',
-          }}
-        />
-      </div>
+      <progress
+        value={clampedPct}
+        max={100}
+        className="gradient-progress w-full"
+        aria-label="progress"
+      >
+        {clampedPct}%
+      </progress>
     </div>
   );
 }
@@ -282,16 +280,17 @@ function MetaLine({ label, value, tone = 'default' }) {
   );
 }
 
+const RIVER_STAGES = ['available', 'scheduled', 'running', 'retryable', 'terminal'];
+
 function RiverStateRail({ state }) {
-  const stages = ['available', 'scheduled', 'running', 'retryable', 'terminal'];
   const terminal = ['completed', 'cancelled', 'discarded'].includes(state);
   const active = terminal ? 'terminal' : state;
 
   return (
     <div className="flex items-center gap-1.5" aria-label={`River job state ${state || 'none'}`}>
-      {stages.map((stage, index) => {
+      {RIVER_STAGES.map((stage, index) => {
         const isActive = active === stage;
-        const complete = !terminal && stages.indexOf(active) > index;
+        const complete = !terminal && RIVER_STAGES.indexOf(active) > index;
         return (
           <React.Fragment key={stage}>
             <span
@@ -307,7 +306,7 @@ function RiverStateRail({ state }) {
                   : 'bg-transparent border-white/15'
                 }`}
             />
-            {index < stages.length - 1 && (
+            {index < RIVER_STAGES.length - 1 && (
               <span className={`h-px w-5 ${complete ? 'bg-gray-500/70' : 'bg-white/10'}`} aria-hidden="true" />
             )}
           </React.Fragment>
@@ -518,6 +517,7 @@ function SyncTaskRunRow({ task, rowAction, runTaskAction, setDeleteTarget, expan
 
         <div className="flex items-center justify-end gap-1">
           <button
+            type="button"
             title={isIncremental ? '启用并投递 kick' : '启动任务'}
             aria-label={`启动任务 ${task.name}`}
             disabled={!canStart}
@@ -527,6 +527,7 @@ function SyncTaskRunRow({ task, rowAction, runTaskAction, setDeleteTarget, expan
             {rowAction === 'start' ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
           </button>
           <button
+            type="button"
             title="取消当前 job 或停用定义"
             aria-label={`停止任务 ${task.name}`}
             disabled={!canStop}
@@ -536,6 +537,7 @@ function SyncTaskRunRow({ task, rowAction, runTaskAction, setDeleteTarget, expan
             {rowAction === 'stop' ? <Loader2 size={14} className="animate-spin" /> : <Square size={14} />}
           </button>
           <button
+            type="button"
             title="重试最近 job"
             aria-label={`重试任务 ${task.name}`}
             disabled={!canRetry}
@@ -545,6 +547,7 @@ function SyncTaskRunRow({ task, rowAction, runTaskAction, setDeleteTarget, expan
             {rowAction === 'retry' ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
           </button>
           <button
+            type="button"
             title="删除任务定义"
             aria-label={`删除任务 ${task.name}`}
             disabled={!canDelete}
@@ -654,7 +657,7 @@ function SelectField({ label, value, onChange, options, id }) {
 
 // ─── Create Task Modal ────────────────────────────────────────────────────────
 
-function CreateTaskModal({ open, onClose, onCreated, tasks }) {
+function CreateTaskModal({ onClose, onCreated, tasks }) {
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [form, setForm] = useState({
@@ -668,7 +671,21 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
   const handleClose = useCallback(() => {
     if (!busy) onClose();
   }, [busy, onClose]);
-  const dialogRef = useFocusTrap(open, handleClose);
+  const dialogRef = useRef(null);
+
+  // Prevent closing (Escape) while a request is in-flight
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const preventClose = (e) => { if (busy) e.preventDefault(); };
+    dialog.addEventListener('cancel', preventClose);
+    return () => dialog.removeEventListener('cancel', preventClose);
+  }, [busy]);
+
+  // Open the modal on mount
+  useEffect(() => {
+    dialogRef.current?.showModal();
+  }, []);
 
   const handleTypeChange = (nextType) => {
     setForm((prev) => ({
@@ -722,26 +739,17 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
     }
   };
 
-  if (!open) return null;
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-        onClick={handleClose}
-      />
-      {/* Modal */}
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label="新建同步任务"
-        className="relative w-full max-w-md mx-4 rounded-2xl border border-white/10 bg-zinc-900 shadow-2xl"
-      >
+    <dialog
+      ref={dialogRef}
+      onClose={handleClose}
+      aria-label="新建同步任务"
+      className="m-auto w-full max-w-md mx-4 rounded-2xl border border-white/10 bg-zinc-900 text-white shadow-2xl p-0"
+    >
         <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
           <h2 className="text-base font-semibold text-white">新建同步任务</h2>
           <button
+            type="button"
             onClick={handleClose}
             className="p-2 -mr-1 text-gray-400 hover:text-white transition-colors rounded-lg hover:bg-white/10"
             aria-label="关闭"
@@ -779,7 +787,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
             />
           ) : form.type === 'incremental' ? (
             <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1.5">分类 (categories)</label>
+              <span className="block text-xs font-medium text-gray-400 mb-1.5">分类 (categories)</span>
               <div className="rounded-lg border border-white/10 bg-white/5 p-2.5 space-y-1.5 max-h-44 overflow-y-auto">
                 {CATEGORY_OPTIONS.map((category) => {
                   const checked = (form.config.categories || []).includes(category);
@@ -861,6 +869,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
 
         <div className="flex justify-end gap-3 px-6 py-4 border-t border-white/10">
           <button
+            type="button"
             onClick={handleClose}
             disabled={busy}
             className="px-4 py-2 text-sm rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-all disabled:opacity-50"
@@ -868,6 +877,7 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
             取消
           </button>
           <button
+            type="submit"
             onClick={handleSubmit}
             disabled={busy || (form.type === 'incremental' && hasIncrementalTask) || (form.type === 'favorites' && hasFavoritesSource)}
             className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-all disabled:opacity-50 flex items-center gap-2"
@@ -876,37 +886,41 @@ function CreateTaskModal({ open, onClose, onCreated, tasks }) {
             创建任务
           </button>
         </div>
-      </div>
-    </div>
+    </dialog>
   );
 }
 
-function DeleteTaskModal({ open, task, busy, onClose, onConfirm }) {
+function DeleteTaskModal({ task, busy, onClose, onConfirm }) {
   const [value, setValue] = useState('');
 
   const handleClose = useCallback(() => {
     if (!busy) onClose();
   }, [busy, onClose]);
-  const dialogRef = useFocusTrap(open && Boolean(task), handleClose);
+  const dialogRef = useRef(null);
 
+  // Prevent closing (Escape) while a delete is in-flight
   useEffect(() => {
-    setValue('');
-  }, [open, task?.id]);
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const preventClose = (e) => { if (busy) e.preventDefault(); };
+    dialog.addEventListener('cancel', preventClose);
+    return () => dialog.removeEventListener('cancel', preventClose);
+  }, [busy]);
 
-  if (!open || !task) return null;
+  // Open the modal on mount
+  useEffect(() => {
+    dialogRef.current?.showModal();
+  }, []);
 
-  const canDelete = value.trim() === task.name;
+  const canDelete = task && value.trim() === task.name;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={handleClose} />
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label="确认删除任务"
-        className="relative w-full max-w-md mx-4 rounded-2xl border border-rose-500/30 bg-zinc-900 shadow-2xl"
-      >
+    <dialog
+      ref={dialogRef}
+      onClose={handleClose}
+      aria-label="确认删除任务"
+      className="m-auto w-full max-w-md mx-4 rounded-2xl border border-rose-500/30 bg-zinc-900 text-white shadow-2xl p-0"
+    >
         <div className="flex items-center gap-2 px-6 py-4 border-b border-white/10">
           <AlertTriangle size={16} className="text-rose-400" />
           <h2 className="text-base font-semibold text-white">确认删除任务</h2>
@@ -931,6 +945,7 @@ function DeleteTaskModal({ open, task, busy, onClose, onConfirm }) {
 
         <div className="flex justify-end gap-3 px-6 py-4 border-t border-white/10">
           <button
+            type="button"
             onClick={handleClose}
             disabled={busy}
             className="px-4 py-2 text-sm rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-all disabled:opacity-50"
@@ -938,6 +953,7 @@ function DeleteTaskModal({ open, task, busy, onClose, onConfirm }) {
             取消
           </button>
           <button
+            type="button"
             onClick={onConfirm}
             disabled={!canDelete || busy}
             className="px-4 py-2 text-sm rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-medium transition-all disabled:opacity-50 flex items-center gap-2"
@@ -946,8 +962,7 @@ function DeleteTaskModal({ open, task, busy, onClose, onConfirm }) {
             删除
           </button>
         </div>
-      </div>
-    </div>
+    </dialog>
   );
 }
 
@@ -970,9 +985,12 @@ function SimilarityDistributionPanel() {
   const dist = data || { buckets: [], total: 0, threshold: 0.3, count_above: 0 };
   const threshold = localThreshold ?? dist.threshold;
 
-  useEffect(() => {
-    if (data) setLocalThreshold(null);
-  }, [data?.threshold]);
+  // Reset local threshold when the server threshold changes (render-time adjustment)
+  const prevServerThresholdRef = useRef(dist.threshold);
+  if (dist.threshold !== prevServerThresholdRef.current) {
+    prevServerThresholdRef.current = dist.threshold;
+    setLocalThreshold(null);
+  }
 
   const maxCount = Math.max(...dist.buckets.map((b) => b.count), 1);
 
@@ -1043,6 +1061,7 @@ function SimilarityDistributionPanel() {
             </div>
             {localThreshold != null && localThreshold !== dist.threshold && (
               <button
+                type="button"
                 onClick={handleSave}
                 disabled={saving}
                 className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-all disabled:opacity-50 flex items-center gap-1.5"
@@ -1062,7 +1081,7 @@ function SimilarityDistributionPanel() {
                 const partial = b.min < threshold && b.max > threshold;
                 return (
                   <div
-                    key={i}
+                    key={`${b.min.toFixed(3)}-${b.max.toFixed(3)}`}
                     className="flex-1 relative group"
                     style={{ height: '100%', display: 'flex', alignItems: 'flex-end' }}
                     title={`${b.min.toFixed(3)} – ${b.max.toFixed(3)}: ${b.count}`}
@@ -1223,30 +1242,48 @@ function RecommendationsPanel() {
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
+const initialUiState = { createOpen: false, deleteTarget: null };
+function uiReducer(state, action) {
+  switch (action.type) {
+    case 'openCreate':
+      return { ...state, createOpen: true };
+    case 'closeCreate':
+      return { ...state, createOpen: false };
+    case 'setDeleteTarget':
+      return { ...state, deleteTarget: action.task };
+    case 'closeDelete':
+      return { ...state, deleteTarget: null };
+    default:
+      return state;
+  }
+}
+
 export default function AdminPage() {
   const queryClient = useQueryClient();
-  const [openCreate, setOpenCreate] = useState(false);
+  const [ui, dispatchUi] = useReducer(uiReducer, initialUiState);
   const [errorMsg, setErrorMsg] = useState('');
   const [pendingByTask, setPendingByTask] = useState({});
-  const [deleteTarget, setDeleteTarget] = useState(null);
   const [activeTab, setActiveTab] = useState('sync');
 
+  const { createOpen: openCreate, deleteTarget } = ui;
+  const setOpenCreate = (v) => dispatchUi({ type: v ? 'openCreate' : 'closeCreate' });
+  const setDeleteTarget = (task) => dispatchUi({ type: task ? 'setDeleteTarget' : 'closeDelete', task });
   const modalOpen = openCreate || Boolean(deleteTarget);
 
-  const tasksQuery = useQuery({
+  const { data: tasksData, isLoading: tasksLoading, isError: tasksError } = useQuery({
     queryKey: ['admin', 'tasks'],
     queryFn: getTasks,
     refetchInterval: false,
   });
 
-  const thumbQuery = useQuery({
+  const { data: thumbData, isError: thumbError } = useQuery({
     queryKey: ['admin', 'thumbStats'],
     queryFn: getThumbStats,
     refetchInterval: false,
   });
 
-  const tasks = tasksQuery.data || [];
-  const stats = thumbQuery.data || { pending: 0, processing: 0, done: 0, waiting: 0 };
+  const tasks = tasksData || [];
+  const stats = thumbData || { pending: 0, processing: 0, done: 0, waiting: 0 };
 
   const refreshActiveTab = useCallback(() => {
     if (activeTab === 'sync') {
@@ -1339,6 +1376,7 @@ export default function AdminPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
+            type="button"
             onClick={() => setOpenCreate(true)}
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all"
           >
@@ -1353,12 +1391,12 @@ export default function AdminPage() {
         <div role="alert" className="rounded-xl bg-rose-500/10 border border-rose-500/30 px-4 py-3 text-sm text-rose-400 flex items-center gap-2">
           <XCircle size={16} />
           {errorMsg}
-          <button onClick={() => setErrorMsg('')} className="ml-auto p-1 hover:text-white transition-colors rounded" aria-label="关闭错误提示">
+          <button type="button" onClick={() => setErrorMsg('')} className="ml-auto p-1 hover:text-white transition-colors rounded" aria-label="关闭错误提示">
             <XCircle size={14} />
           </button>
         </div>
       )}
-      {(tasksQuery.isError || thumbQuery.isError) && (
+      {(tasksError || thumbError) && (
         <div role="alert" className="rounded-xl bg-rose-500/10 border border-rose-500/30 px-4 py-3 text-sm text-rose-400 flex items-center gap-2">
           <XCircle size={16} />
           加载数据失败，请检查后端连接
@@ -1390,7 +1428,7 @@ export default function AdminPage() {
       {activeTab === 'sync' && (
         <SyncRunsPanel
           tasks={tasks}
-          isLoading={tasksQuery.isLoading}
+          isLoading={tasksLoading}
           pendingByTask={pendingByTask}
           runTaskAction={runTaskAction}
           setDeleteTarget={setDeleteTarget}
@@ -1400,21 +1438,23 @@ export default function AdminPage() {
       {activeTab === 'recommendations' && <RecommendationsPanel />}
 
       {/* Create Task Modal */}
-      <CreateTaskModal
-        open={openCreate}
-        onClose={() => setOpenCreate(false)}
-        onCreated={refresh}
-        tasks={tasks}
-      />
+      {openCreate && (
+        <CreateTaskModal
+          onClose={() => setOpenCreate(false)}
+          onCreated={refresh}
+          tasks={tasks}
+        />
+      )}
 
       {/* Delete Confirm Modal */}
-      <DeleteTaskModal
-        open={Boolean(deleteTarget)}
-        task={deleteTarget}
-        busy={deleteTarget ? pendingByTask[deleteTarget.id] === 'delete' : false}
-        onClose={() => setDeleteTarget(null)}
-        onConfirm={handleDeleteConfirm}
-      />
+      {deleteTarget && (
+        <DeleteTaskModal
+          task={deleteTarget}
+          busy={pendingByTask[deleteTarget.id] === 'delete'}
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={handleDeleteConfirm}
+        />
+      )}
     </div>
   );
 }

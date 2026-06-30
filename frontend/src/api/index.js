@@ -1,8 +1,4 @@
-import axios from 'axios';
-
-const api = axios.create({
-  baseURL: '/v1',
-});
+const BASE = '/v1';
 
 export const fetchGalleries = async (params) => {
   const { tags, ...rest } = params;
@@ -13,16 +9,19 @@ export const fetchGalleries = async (params) => {
   if (Array.isArray(tags)) {
     for (const t of tags) { if (t) query.append('tag', t); }
   }
-  const { data } = await api.get(`/galleries?${query.toString()}`);
-  return data;
+  const resp = await fetch(`${BASE}/galleries?${query.toString()}`);
+  if (!resp.ok) throw new Error(`Request failed: ${resp.status}`);
+  return resp.json();
 };
 
-export const fetchStats = async () => {
-  const { data } = await api.get('/stats');
-  return data;
+const fetchStats = async () => {
+  const resp = await fetch(`${BASE}/stats`);
+  if (!resp.ok) throw new Error(`Request failed: ${resp.status}`);
+  return resp.json();
 };
 
 export const fetchGalleryGroup = async (groupId) => {
-  const { data } = await api.get(`/galleries/group/${groupId}`);
-  return data;
+  const resp = await fetch(`${BASE}/galleries/group/${groupId}`);
+  if (!resp.ok) throw new Error(`Request failed: ${resp.status}`);
+  return resp.json();
 };

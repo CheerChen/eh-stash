@@ -32,8 +32,9 @@ function SelectField({ value, onChange, children, className = '', id }) {
 }
 
 const SUGGESTION_LIMIT = 8;
+const EMPTY_TAGS = [];
 
-const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
+const FilterPanel = ({ filters, onChange, tagSuggestions = EMPTY_TAGS }) => {
   const [collapsed, setCollapsed] = useState(true);
   const [tagInput, setTagInput] = useState('');
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -41,7 +42,7 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
   const tagInputRef = useRef(null);
   const listboxId = useId();
 
-  const tags = filters.tags || [];
+  const tags = filters.tags || EMPTY_TAGS;
 
   const filteredSuggestions = useMemo(() => {
     const keyword = tagInput.trim().toLowerCase();
@@ -177,8 +178,6 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
                   ref={tagInputRef}
                   id="filter-tag-input"
                   type="text"
-                  role="combobox"
-                  aria-expanded={hasSuggestions}
                   aria-controls={listboxId}
                   aria-activedescendant={activeOptionId}
                   aria-autocomplete="list"
@@ -249,16 +248,14 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
                 )}
               </div>
               {hasSuggestions && (
-                <ul
+                <div
                   id={listboxId}
-                  role="listbox"
                   className="absolute top-full mt-1 z-40 w-full rounded-lg border border-white/10 bg-zinc-900 shadow-xl overflow-hidden"
                 >
                   {filteredSuggestions.map((suggestion, idx) => (
-                    <li
+                    <div
                       key={suggestion}
                       id={`${listboxId}-option-${idx}`}
-                      role="option"
                       aria-selected={idx === activeSuggestion}
                     >
                       <button
@@ -273,9 +270,9 @@ const FilterPanel = ({ filters, onChange, tagSuggestions = [] }) => {
                       >
                         {suggestion}
                       </button>
-                    </li>
+                    </div>
                   ))}
-                </ul>
+                </div>
               )}
             </div>
             {showSuggestions && filteredSuggestions.length === 0 && tagInput.trim() && (

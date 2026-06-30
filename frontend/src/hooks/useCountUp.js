@@ -21,21 +21,25 @@ export function useCountUp(target, duration = 500) {
             frameRef.current = null;
         }
 
+        // Determine if we can short-circuit with an immediate value (no animation needed)
+        let immediate = undefined;
         if (target === null || target === undefined) {
             prevRef.current = null;
-            setDisplayed(null);
+            immediate = null;
+        } else {
+            const from = prevRef.current ?? 0;
+            const to = target;
+            prevRef.current = target;
+            if (from === to) immediate = to;
+        }
+
+        if (immediate !== undefined) {
+            setDisplayed(immediate);
             return;
         }
 
         const from = prevRef.current ?? 0;
         const to = target;
-        prevRef.current = target;
-
-        if (from === to) {
-            setDisplayed(to);
-            return;
-        }
-
         startTimeRef.current = null;
 
         const step = (timestamp) => {

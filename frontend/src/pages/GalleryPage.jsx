@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo, useReducer } from 'react';
 import { useQuery, keepPreviousData } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { LayoutGrid, LayoutList, ChevronFirst, ChevronLast, ChevronLeft, ChevronRight, Loader2, AlertCircle, Heart, Star, MessageCircle, Calendar, ChevronDown, Languages, Sparkles } from 'lucide-react';
@@ -71,6 +71,7 @@ function SortDropdown({ value, onChange }) {
   return (
     <div className="relative" ref={ref}>
       <button
+        type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         aria-haspopup="listbox"
@@ -82,12 +83,12 @@ function SortDropdown({ value, onChange }) {
         <ChevronDown size={11} className="text-gray-600" />
       </button>
       {open && (
-        <div role="listbox" aria-label="排序选项" className="absolute right-0 top-full mt-1 w-32 rounded-lg bg-zinc-900 border border-white/10 shadow-xl z-50 overflow-hidden">
+        <div aria-label="排序选项" className="absolute right-0 top-full mt-1 w-32 rounded-lg bg-zinc-900 border border-white/10 shadow-xl z-50 overflow-hidden">
           {SORT_OPTIONS.map((o) => (
             <button
               key={o.value}
-              role="option"
-              aria-selected={o.value === value}
+              type="button"
+              aria-pressed={o.value === value}
               onClick={() => { onChange(o.value); setOpen(false); }}
               className={`w-full flex items-center gap-2 px-3 py-2 text-xs transition-colors ${o.value === value ? 'text-white bg-white/10' : 'text-gray-400 hover:text-white hover:bg-white/5'
                 }`}
@@ -112,6 +113,7 @@ function RatingCycleButton({ value, onChange }) {
   };
   return (
     <button
+      type="button"
       onClick={cycle}
       aria-label={active ? `最低评分 ${value}` : '评分筛选: 全部'}
       className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${active
@@ -127,13 +129,13 @@ function RatingCycleButton({ value, onChange }) {
 
 // ─── Pagination Bar ───────────────────────────────────────────────────────────
 
-function PaginationBar({ page, totalPages, onPageChange }) {
-  const btnCls = (disabled) =>
-    `flex items-center justify-center w-10 h-10 rounded-lg transition-colors ${disabled
-      ? 'text-gray-700 cursor-not-allowed'
-      : 'text-gray-300 hover:bg-white/10 hover:text-white'
-    }`;
+const PAGINATION_BTN_CLS = (disabled) =>
+  `flex items-center justify-center w-10 h-10 rounded-lg transition-colors ${disabled
+    ? 'text-gray-700 cursor-not-allowed'
+    : 'text-gray-300 hover:bg-white/10 hover:text-white'
+  }`;
 
+function PaginationBar({ page, totalPages, onPageChange }) {
   const pageNums = () => {
     const pages = [];
     const delta = 2;
@@ -150,10 +152,10 @@ function PaginationBar({ page, totalPages, onPageChange }) {
   return (
     <nav aria-label="分页" className="fixed bottom-0 left-0 right-0 z-30 flex justify-center py-2 bg-zinc-950/80 backdrop-blur-md border-t border-white/5">
       <div className="flex items-center gap-1">
-        <button className={btnCls(page === 1)} onClick={() => onPageChange(1)} disabled={page === 1} aria-label="第一页">
+        <button type="button" className={PAGINATION_BTN_CLS(page === 1)} onClick={() => onPageChange(1)} disabled={page === 1} aria-label="第一页">
           <ChevronFirst size={16} />
         </button>
-        <button className={btnCls(page === 1)} onClick={() => onPageChange(page - 1)} disabled={page === 1} aria-label="上一页">
+        <button type="button" className={PAGINATION_BTN_CLS(page === 1)} onClick={() => onPageChange(page - 1)} disabled={page === 1} aria-label="上一页">
           <ChevronLeft size={16} />
         </button>
 
@@ -163,6 +165,7 @@ function PaginationBar({ page, totalPages, onPageChange }) {
             : (
               <button
                 key={p}
+                type="button"
                 onClick={() => onPageChange(p)}
                 aria-label={`第 ${p} 页`}
                 aria-current={p === page ? 'page' : undefined}
@@ -176,10 +179,10 @@ function PaginationBar({ page, totalPages, onPageChange }) {
             )
         )}
 
-        <button className={btnCls(page === totalPages)} onClick={() => onPageChange(page + 1)} disabled={page === totalPages} aria-label="下一页">
+        <button type="button" className={PAGINATION_BTN_CLS(page === totalPages)} onClick={() => onPageChange(page + 1)} disabled={page === totalPages} aria-label="下一页">
           <ChevronRight size={16} />
         </button>
-        <button className={btnCls(page === totalPages)} onClick={() => onPageChange(totalPages)} disabled={page === totalPages} aria-label="最后一页">
+        <button type="button" className={PAGINATION_BTN_CLS(page === totalPages)} onClick={() => onPageChange(totalPages)} disabled={page === totalPages} aria-label="最后一页">
           <ChevronLast size={16} />
         </button>
       </div>
@@ -189,14 +192,39 @@ function PaginationBar({ page, totalPages, onPageChange }) {
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
+function navReducer(state, action) {
+  switch (action.type) {
+    case 'setFilters':
+      return { ...state, filters: action.filters, page: 1 };
+    case 'setFiltersFn':
+      return { ...state, filters: action.updater(state.filters), page: 1 };
+    case 'setPage':
+      return { ...state, page: action.page };
+    default:
+      return state;
+  }
+}
+
 const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const defaultSort = (favoritesOnly || recommendedOnly) ? 'posted_at' : 'fav_count';
   const defaults = { sort: defaultSort, is_favorited: favoritesOnly };
 
-  const [filters, setFilters] = useState(() => filtersFromParams(searchParams, defaults));
-  const [page, setPage] = useState(() => Number(searchParams.get('page')) || 1);
+  const [nav, dispatchNav] = useReducer(navReducer, undefined, () => ({
+    filters: filtersFromParams(searchParams, defaults),
+    page: Number(searchParams.get('page')) || 1,
+  }));
+  const { filters, page } = nav;
+  const setFilters = (newFilters) => {
+    if (typeof newFilters === 'function') {
+      dispatchNav({ type: 'setFiltersFn', updater: newFilters });
+    } else {
+      dispatchNav({ type: 'setFilters', filters: newFilters });
+    }
+  };
+  const setPage = (newPage) => dispatchNav({ type: 'setPage', page: newPage });
+
   const [viewMode, setViewMode] = useState(getInitialViewMode);
   const [showTranslation, setShowTranslation] = useState(false);
   const [groupModalId, setGroupModalId] = useState(null);
@@ -254,7 +282,7 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
   const totalPages = data?.pages || 1;
   const total = data?.total ?? 0;
   const filteredItems = rawItems.filter((g) => !filters.min_rating || (g.rating ?? 0) >= filters.min_rating);
-  const sortedItems = [...filteredItems].sort(SORT_FNS[filters.sort] ?? SORT_FNS.fav_count);
+  const sortedItems = filteredItems.toSorted(SORT_FNS[filters.sort] ?? SORT_FNS.fav_count);
 
   // Aggregate same-group galleries: keep first occurrence per group_id
   const items = useMemo(() => {
@@ -280,7 +308,7 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
       }
     }
     return [...freq.entries()]
-      .sort((a, b) => {
+      .toSorted((a, b) => {
         if (b[1] !== a[1]) return b[1] - a[1];
         return a[0].localeCompare(b[0]);
       })
@@ -313,6 +341,7 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
           {/* Translation toggle – only useful in list mode */}
           {viewMode === 'list' && (
             <button
+              type="button"
               onClick={() => setShowTranslation((v) => !v)}
               aria-label={showTranslation ? '关闭中文翻译' : '开启中文翻译'}
               aria-pressed={showTranslation}
@@ -334,6 +363,7 @@ const GalleryPage = ({ favoritesOnly = false, recommendedOnly = false }) => {
             onChange={(v) => setFilters((prev) => ({ ...prev, min_rating: v }))}
           />
           <button
+            type="button"
             onClick={toggleViewMode}
             aria-label={viewMode === 'grid' ? '切换到列表视图' : '切换到网格视图'}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-gray-400 hover:text-white hover:bg-white/10 transition-all border border-white/10"

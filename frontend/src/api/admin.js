@@ -26,7 +26,7 @@ export function createTask(data) {
   });
 }
 
-export function updateTask(id, data) {
+function updateTask(id, data) {
   return request(`/tasks/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },

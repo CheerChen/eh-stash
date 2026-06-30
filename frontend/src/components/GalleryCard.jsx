@@ -197,6 +197,7 @@ function ListRow({ gallery, onTagSearch, translate, onGroupClick }) {
           )}
           {gallery.group_count > 1 && (
             <button
+              type="button"
               onClick={(e) => { e.stopPropagation(); onGroupClick?.(gallery.group_id); }}
               className="flex items-center gap-0.5 text-amber-400 hover:text-amber-300 cursor-pointer"
               aria-label={`查看 ${gallery.group_count} 个版本`}

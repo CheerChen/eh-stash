@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 const TAG_TRANS_URL =
     'https://raw.githubusercontent.com/scooderic/exhentai-tags-chinese-translation/refs/heads/master/dist/ehtags-cn.json';
@@ -42,13 +42,19 @@ function loadTranslations() {
  */
 export function useTagTranslation(enabled) {
     const [dict, setDict] = useState(_cache);
+    const prevEnabledRef = useRef(enabled);
+
+    // Sync dict from module cache inline during render when enabled flips on
+    if (enabled && prevEnabledRef.current !== enabled && _cache) {
+        prevEnabledRef.current = enabled;
+        setDict(_cache);
+    } else {
+        prevEnabledRef.current = enabled;
+    }
 
     useEffect(() => {
         if (!enabled) return;
-        if (_cache) {
-            setDict(_cache);
-            return;
-        }
+        if (_cache) return;
         loadTranslations().then((data) => {
             if (data) setDict(data);
         });
