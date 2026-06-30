@@ -687,6 +687,10 @@ function CreateTaskModal({ onClose, onCreated, tasks }) {
     dialogRef.current?.showModal();
   }, []);
 
+  const handleBackdropClick = (e) => {
+    if (e.target === dialogRef.current) handleClose();
+  };
+
   const handleTypeChange = (nextType) => {
     setForm((prev) => ({
       ...prev,
@@ -743,8 +747,9 @@ function CreateTaskModal({ onClose, onCreated, tasks }) {
     <dialog
       ref={dialogRef}
       onClose={handleClose}
+      onClick={handleBackdropClick}
       aria-label="新建同步任务"
-      className="m-auto w-full max-w-md mx-4 rounded-2xl border border-white/10 bg-zinc-900 text-white shadow-2xl p-0"
+      className="m-auto w-full max-w-[calc(100%-2rem)] sm:max-w-md rounded-2xl border border-white/10 bg-zinc-900 text-white shadow-2xl p-0"
     >
         <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
           <h2 className="text-base font-semibold text-white">新建同步任务</h2>
@@ -912,14 +917,19 @@ function DeleteTaskModal({ task, busy, onClose, onConfirm }) {
     dialogRef.current?.showModal();
   }, []);
 
+  const handleBackdropClick = (e) => {
+    if (e.target === dialogRef.current) handleClose();
+  };
+
   const canDelete = task && value.trim() === task.name;
 
   return (
     <dialog
       ref={dialogRef}
       onClose={handleClose}
+      onClick={handleBackdropClick}
       aria-label="确认删除任务"
-      className="m-auto w-full max-w-md mx-4 rounded-2xl border border-rose-500/30 bg-zinc-900 text-white shadow-2xl p-0"
+      className="m-auto w-full max-w-[calc(100%-2rem)] sm:max-w-md rounded-2xl border border-rose-500/30 bg-zinc-900 text-white shadow-2xl p-0"
     >
         <div className="flex items-center gap-2 px-6 py-4 border-b border-white/10">
           <AlertTriangle size={16} className="text-rose-400" />

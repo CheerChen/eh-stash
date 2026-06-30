@@ -29,6 +29,10 @@ export default function GroupModal({ groupId, onClose }) {
     dialog.showModal();
   }, []);
 
+  const handleBackdropClick = (e) => {
+    if (e.target === dialogRef.current) onClose();
+  };
+
   useEffect(() => {
     if (!groupId) return;
     dispatch({ type: 'load' });
@@ -41,8 +45,9 @@ export default function GroupModal({ groupId, onClose }) {
     <dialog
       ref={dialogRef}
       onClose={onClose}
+      onClick={handleBackdropClick}
       aria-label={loading ? '加载中' : `${galleries.length} 个版本`}
-      className="m-auto rounded-lg ring-1 ring-white/10 w-full max-w-2xl max-h-[80vh] overflow-y-auto p-0 bg-zinc-900 text-white"
+      className="m-auto rounded-lg ring-1 ring-white/10 w-full max-w-[calc(100%-2rem)] sm:max-w-2xl max-h-[80vh] overflow-y-auto p-0 bg-zinc-900 text-white"
     >
       {/* Header */}
       <div className="sticky top-0 bg-zinc-900 border-b border-white/10 px-4 py-3 flex items-center justify-between">

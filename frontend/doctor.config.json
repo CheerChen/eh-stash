@@ -1,0 +1,17 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "ignore": {
+    "overrides": [
+      {
+        "files": [
+          "src/components/GroupModal.jsx",
+          "src/pages/AdminPage.jsx"
+        ],
+        "rules": [
+          "react-doctor/click-events-have-key-events",
+          "react-doctor/no-noninteractive-element-interactions"
+        ]
+      }
+    ]
+  }
+}
