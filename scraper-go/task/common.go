@@ -1,6 +1,7 @@
 package task
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -158,6 +159,58 @@ func BuildUpsertRow(gid int64, token string, detail *parser.GalleryDetail, isAct
 		Thumb:        detail.Thumb,
 		Tags:         detail.Tags,
 		IsActive:     isActive,
+
+		FileSize:      detail.FileSize,
+		FileSizeBytes: detail.FileSizeBytes,
+		RatingCount:   detail.RatingCount,
+		Visible:       detail.Visible,
+		ParentGID:     detail.ParentGID,
+		TorrentCount:  detail.TorrentCount,
+		IsExpunged:    detail.IsExpunged,
+	}
+}
+
+// BuildCommentRows converts parser.Comment slices into db.CommentRow slices
+// for the given gid. The caller is responsible for invoking
+// db.ReplaceCommentsForGID with the result.
+func BuildCommentRows(gid int64, comments []parser.Comment) []db.CommentRow {
+	if len(comments) == 0 {
+		return nil
+	}
+	rows := make([]db.CommentRow, len(comments))
+	for i, c := range comments {
+		rows[i] = db.CommentRow{
+			GID:               gid,
+			CommentIndex:      c.Index,
+			Author:            c.Author,
+			AuthorURL:         c.AuthorURL,
+			PostedAt:          c.PostedAt,
+			Score:             c.Score,
+			Body:              c.Body,
+			IsUploaderComment: c.IsUploaderComment,
+		}
+	}
+	return rows
+}
+
+// CommentBatch pairs a gid with its parsed comments, for deferred
+// ReplaceCommentsForGID calls after the gallery bulk upsert succeeds.
+type CommentBatch struct {
+	GID      int64
+	Comments []db.CommentRow
+}
+
+// FlushCommentBatches calls ReplaceCommentsForGID for each batch. Errors are
+// logged but not returned — comment persistence is best-effort and must not
+// block the gallery upsert pipeline.
+func FlushCommentBatches(ctx context.Context, database *db.DB, batches []CommentBatch) {
+	for _, b := range batches {
+		if err := database.ReplaceCommentsForGID(ctx, b.GID, b.Comments); err != nil {
+			slog.Warn("replace comments failed",
+				"gid", b.GID,
+				"error", err,
+			)
+		}
 	}
 }
 

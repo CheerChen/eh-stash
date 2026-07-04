@@ -84,6 +84,7 @@ func RunFavoritesOnce(
 
 		if len(nonExisting) > 0 {
 			var rowsToUpsert []db.GalleryRow
+			var commentBatches []CommentBatch
 			for _, gid := range nonExisting {
 				if failedGIDs[gid] {
 					continue
@@ -127,12 +128,17 @@ func RunFavoritesOnce(
 				}
 
 				rowsToUpsert = append(rowsToUpsert, BuildUpsertRow(gid, token, detail, isActive))
+				commentBatches = append(commentBatches, CommentBatch{
+					GID:      gid,
+					Comments: BuildCommentRows(gid, detail.Comments),
+				})
 			}
 
 			if len(rowsToUpsert) > 0 {
 				if _, err := database.UpsertGalleriesBulk(ctx, rowsToUpsert); err != nil {
 					slog.Error(fmt.Sprintf("[FAV  ] [%s] upsert failed", name), "error", err)
 				} else {
+					FlushCommentBatches(ctx, database, commentBatches)
 					notify(signals.GrouperTrigger)
 				}
 			}

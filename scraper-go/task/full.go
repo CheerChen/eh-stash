@@ -83,6 +83,7 @@ func RunFullOnce(
 		name, category, len(listResult.Items), listResult.NextCursor, checkpoint["total_count"]))
 
 	var rowsToUpsert []db.GalleryRow
+	var commentBatches []CommentBatch
 	nDeleted := 0
 
 	for _, item := range listResult.Items {
@@ -116,6 +117,10 @@ func RunFullOnce(
 
 		row := BuildUpsertRow(item.GID, item.Token, detail, !item.IsDeleted)
 		rowsToUpsert = append(rowsToUpsert, row)
+		commentBatches = append(commentBatches, CommentBatch{
+			GID:      item.GID,
+			Comments: BuildCommentRows(item.GID, detail.Comments),
+		})
 	}
 
 	slog.Info(fmt.Sprintf("[FULL ] [%s] page_items=%d upsert=%d deleted=%d",
@@ -125,6 +130,7 @@ func RunFullOnce(
 		if _, err := database.UpsertGalleriesBulk(ctx, rowsToUpsert); err != nil {
 			return false, fmt.Errorf("upsert galleries: %w", err)
 		}
+		FlushCommentBatches(ctx, database, commentBatches)
 		notify(grouperTrigger)
 	}
 

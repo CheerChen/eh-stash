@@ -122,6 +122,7 @@ func RunIncrementalSlice(
 	}
 
 	var rowsToUpsert []db.GalleryRow
+	var commentBatches []CommentBatch
 	nNew, nRefresh, nSkip := 0, 0, 0
 	banned := false
 	total := len(listResult.Items)
@@ -201,6 +202,10 @@ func RunIncrementalSlice(
 				continue
 			}
 			rowsToUpsert = append(rowsToUpsert, BuildUpsertRow(item.GID, item.Token, detail, true))
+			commentBatches = append(commentBatches, CommentBatch{
+				GID:      item.GID,
+				Comments: BuildCommentRows(item.GID, detail.Comments),
+			})
 			nNew++
 			slog.Info("[INCR ] item new ok",
 				"name", name,
@@ -249,6 +254,10 @@ func RunIncrementalSlice(
 					continue
 				}
 				rowsToUpsert = append(rowsToUpsert, BuildUpsertRow(item.GID, item.Token, detail, true))
+				commentBatches = append(commentBatches, CommentBatch{
+					GID:      item.GID,
+					Comments: BuildCommentRows(item.GID, detail.Comments),
+				})
 				nRefresh++
 				slog.Info("[INCR ] item refresh ok",
 					"name", name,
@@ -286,6 +295,7 @@ func RunIncrementalSlice(
 			)
 			return result, fmt.Errorf("upsert galleries: %w", err)
 		}
+		FlushCommentBatches(ctx, database, commentBatches)
 		notify(grouperTrigger)
 	}
 
@@ -347,6 +357,13 @@ func parseCategories(cfg map[string]any) []string {
 }
 
 func shouldRefreshFromList(existing map[string]any, item *parser.GalleryListItem, threshold float64) bool {
+	// Force refresh for old-style detail rows that predate 006_detail_extras.
+	// file_size IS NULL means the row was written by the old parser and is
+	// missing file_size / rating_count / visible / parent_gid / torrent_count.
+	if fileSize, ok := existing["file_size"].(*string); ok && fileSize == nil {
+		return true
+	}
+
 	existingTags, _ := existing["tags"].(map[string][]string)
 	detailTags := flattenTags(existingTags)
 	for _, tag := range item.VisibleTags {

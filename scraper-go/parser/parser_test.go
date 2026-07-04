@@ -201,3 +201,129 @@ func extractRatingFromSprite(x, y int) (string, *float64) {
 	}
 	return "", nil
 }
+
+func TestParseDetailExtras(t *testing.T) {
+	html := `<html><body>
+	<div class="gm">
+		<div id="gn">Test</div>
+		<div id="gdn"><a href="https://exhentai.org/uploader/foo">foo</a></div>
+		<div id="rating_label">Average: 4.50</div>
+		<span id="rating_count">1,234</span>
+		<div id="gdd"><table>
+			<tr><td>Posted:</td><td>2024-01-15 12:00</td></tr>
+			<tr><td>Parent:</td><td><a href="https://exhentai.org/g/99999/abc/">link</a></td></tr>
+			<tr><td>Visible:</td><td>No (Replaced)</td></tr>
+			<tr><td>Language:</td><td>English</td></tr>
+			<tr><td>File Size:</td><td>3.54 GiB</td></tr>
+			<tr><td>Length:</td><td>10 pages</td></tr>
+			<tr><td>Favorited:</td><td>5 times</td></tr>
+		</table></div>
+		<div id="cdiv">
+			<div class="c1">
+				<div class="c3">Posted on 26 June 2026, 15:56 by: <a href="https://exhentai.org/uploader/foo">foo</a></div>
+				<div class="c4">Uploader Comment</div>
+				<div class="c6">Source: https://example.com</div>
+				<div class="c7">3</div>
+			</div>
+			<div class="c1">
+				<div class="c3">Posted on 27 June 2026, 10:00 by: <a href="https://exhentai.org/uploader/bar">bar</a></div>
+				<div class="c6">Nice gallery!</div>
+			</div>
+		</div>
+	</div>
+	<div id="gd5">Torrent Download (7)</div>
+	</body></html>`
+
+	d, err := ParseDetail(html)
+	if err != nil {
+		t.Fatalf("ParseDetail error: %v", err)
+	}
+	if d == nil {
+		t.Fatal("ParseDetail returned nil")
+	}
+
+	if d.UploaderURL != "https://exhentai.org/uploader/foo" {
+		t.Errorf("UploaderURL = %q", d.UploaderURL)
+	}
+	if d.RatingCount == nil || *d.RatingCount != 1234 {
+		t.Errorf("RatingCount = %v", d.RatingCount)
+	}
+	if d.FileSize != "3.54 GiB" {
+		t.Errorf("FileSize = %q", d.FileSize)
+	}
+	wantBytes := parseFileSizeBytes("3.54 GiB")
+	if d.FileSizeBytes == nil {
+		t.Errorf("FileSizeBytes = nil, want non-nil")
+	} else if wantBytes == nil || *d.FileSizeBytes != *wantBytes {
+		t.Errorf("FileSizeBytes = %d, want %v", *d.FileSizeBytes, wantBytes)
+	}
+	if d.Visible != "No (Replaced)" {
+		t.Errorf("Visible = %q", d.Visible)
+	}
+	if !d.IsExpunged {
+		t.Errorf("IsExpunged = false, want true (Visible contains Replaced)")
+	}
+	if d.ParentGID == nil || *d.ParentGID != 99999 {
+		t.Errorf("ParentGID = %v", d.ParentGID)
+	}
+	if d.TorrentCount != 7 {
+		t.Errorf("TorrentCount = %d", d.TorrentCount)
+	}
+	if d.CommentCount != 2 {
+		t.Errorf("CommentCount = %d", d.CommentCount)
+	}
+	if len(d.Comments) != 2 {
+		t.Fatalf("Comments len = %d, want 2", len(d.Comments))
+	}
+	c0 := d.Comments[0]
+	if c0.Index != 0 || c0.Author != "foo" || !c0.IsUploaderComment {
+		t.Errorf("Comment[0] = %+v", c0)
+	}
+	if c0.PostedAt != "26 June 2026, 15:56" {
+		t.Errorf("Comment[0].PostedAt = %q", c0.PostedAt)
+	}
+	if c0.Body != "Source: https://example.com" {
+		t.Errorf("Comment[0].Body = %q", c0.Body)
+	}
+	if c0.Score == nil || *c0.Score != 3 {
+		t.Errorf("Comment[0].Score = %v", c0.Score)
+	}
+	c1 := d.Comments[1]
+	if c1.Author != "bar" || c1.IsUploaderComment {
+		t.Errorf("Comment[1] = %+v", c1)
+	}
+	if c1.Score != nil {
+		t.Errorf("Comment[1].Score = %v, want nil", *c1.Score)
+	}
+}
+
+func TestParseFileSizeBytes(t *testing.T) {
+	tests := []struct {
+		input string
+		ok    bool
+	}{
+		{"500 B", true},
+		{"1.00 KiB", true},
+		{"18.39 MiB", true},
+		{"3.54 GiB", true},
+		{"2 TB", true},
+		{"no size here", false},
+	}
+	for _, tt := range tests {
+		got := parseFileSizeBytes(tt.input)
+		if !tt.ok {
+			if got != nil {
+				t.Errorf("parseFileSizeBytes(%q) = %v, want nil", tt.input, *got)
+			}
+			continue
+		}
+		if got == nil {
+			t.Errorf("parseFileSizeBytes(%q) = nil, want non-nil", tt.input)
+		}
+		// Verify round-trip: the same input parsed twice gives the same result.
+		got2 := parseFileSizeBytes(tt.input)
+		if (got == nil) != (got2 == nil) || (got != nil && *got != *got2) {
+			t.Errorf("parseFileSizeBytes(%q) not deterministic: %v vs %v", tt.input, got, got2)
+		}
+	}
+}

@@ -61,6 +61,29 @@ type GalleryRow struct {
 	Thumb        string
 	Tags         map[string][]string
 	IsActive     bool
+
+	// Fields captured since 006_detail_extras. All pointer/nullable types
+	// so zero-value GalleryRows (e.g. from list-only scans) leave the DB
+	// columns NULL, which is the "old-style detail, needs refresh" signal.
+	FileSize      string
+	FileSizeBytes *int64
+	RatingCount   *int
+	Visible       string
+	ParentGID     *int64
+	TorrentCount  int
+	IsExpunged    bool
+}
+
+// CommentRow represents a row to upsert into gallery_comments.
+type CommentRow struct {
+	GID               int64
+	CommentIndex      int
+	Author            string
+	AuthorURL         string
+	PostedAt          string
+	Score             *int
+	Body              string
+	IsUploaderComment bool
 }
 
 type ThumbQueueItem struct {
@@ -88,21 +111,25 @@ func (d *DB) UpsertGalleriesBulk(ctx context.Context, rows []GalleryRow) (int, e
 	for _, r := range rows {
 		tagsJSON, _ := json.Marshal(r.Tags)
 		values = append(values, fmt.Sprintf(
-			"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d::jsonb,NOW(),$%d)",
+			"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d::jsonb,NOW(),$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 			idx, idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7,
-			idx+8, idx+9, idx+10, idx+11, idx+12, idx+13, idx+14, idx+15,
+			idx+8, idx+9, idx+10, idx+11, idx+12, idx+13, idx+14,
+			idx+15, idx+16, idx+17, idx+18, idx+19, idx+20, idx+21, idx+22,
 		))
 		args = append(args,
 			r.GID, r.Token, r.Category, r.Title, r.TitleJPN, r.BaseTitle, r.Uploader,
 			r.PostedAt, r.Language, r.Pages, r.Rating, r.FavCount,
 			r.CommentCount, r.Thumb, string(tagsJSON), r.IsActive,
+			r.FileSize, r.FileSizeBytes, r.RatingCount, r.Visible,
+			r.ParentGID, r.TorrentCount, r.IsExpunged,
 		)
-		idx += 16
+		idx += 23
 	}
 
 	sql := `INSERT INTO eh_galleries (
 		gid, token, category, title, title_jpn, base_title, uploader, posted_at, language,
-		pages, rating, fav_count, comment_count, thumb, tags, last_synced_at, is_active
+		pages, rating, fav_count, comment_count, thumb, tags, last_synced_at, is_active,
+		file_size, file_size_bytes, rating_count, visible, parent_gid, torrent_count, is_expunged
 	) VALUES ` + strings.Join(values, ",") + `
 	ON CONFLICT (gid) DO UPDATE SET
 		token = EXCLUDED.token, category = EXCLUDED.category,
@@ -113,7 +140,14 @@ func (d *DB) UpsertGalleriesBulk(ctx context.Context, rows []GalleryRow) (int, e
 		rating = EXCLUDED.rating, fav_count = EXCLUDED.fav_count,
 		comment_count = EXCLUDED.comment_count, thumb = EXCLUDED.thumb,
 		tags = EXCLUDED.tags, last_synced_at = NOW(),
-		is_active = eh_galleries.is_active AND EXCLUDED.is_active`
+		is_active = eh_galleries.is_active AND EXCLUDED.is_active,
+		file_size = EXCLUDED.file_size,
+		file_size_bytes = EXCLUDED.file_size_bytes,
+		rating_count = EXCLUDED.rating_count,
+		visible = EXCLUDED.visible,
+		parent_gid = EXCLUDED.parent_gid,
+		torrent_count = EXCLUDED.torrent_count,
+		is_expunged = EXCLUDED.is_expunged`
 
 	_, err = tx.Exec(ctx, sql, args...)
 	if err != nil {
@@ -192,6 +226,50 @@ func (d *DB) UpsertGalleriesBulk(ctx context.Context, rows []GalleryRow) (int, e
 		return 0, err
 	}
 	return len(rows), nil
+}
+
+// ReplaceCommentsForGID deletes all existing comments for the given gid and
+// inserts the new batch in a single transaction. Called after each detail
+// fetch so comment edits / deletions on EH's side are reflected. An empty
+// rows slice still clears existing comments (the gallery may have had all
+// comments removed).
+func (d *DB) ReplaceCommentsForGID(ctx context.Context, gid int64, rows []CommentRow) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM gallery_comments WHERE gid = $1`, gid); err != nil {
+		return fmt.Errorf("delete gallery_comments: %w", err)
+	}
+
+	if len(rows) > 0 {
+		var values []string
+		var args []any
+		args = append(args, gid)
+		idx := 2
+		for _, r := range rows {
+			values = append(values, fmt.Sprintf(
+				"($1,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				idx, idx+1, idx+2, idx+3, idx+4, idx+5, idx+6,
+			))
+			args = append(args,
+				r.CommentIndex, r.Author, r.AuthorURL, r.PostedAt,
+				r.Score, r.Body, r.IsUploaderComment,
+			)
+			idx += 7
+		}
+		sql := `INSERT INTO gallery_comments
+			(gid, comment_index, author, author_url, posted_at, score, body, is_uploader_comment)
+			VALUES ` + strings.Join(values, ",")
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			return fmt.Errorf("insert gallery_comments: %w", err)
+		}
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (d *DB) ClaimNextThumbQueueItem(ctx context.Context) (*ThumbQueueItem, error) {
@@ -471,9 +549,10 @@ func (d *DB) GalleryGroupIsEmpty(ctx context.Context) (bool, error) {
 func (d *DB) GetGalleryByGID(ctx context.Context, gid int64) (map[string]any, error) {
 	var tagsJSON []byte
 	var rating *float64
+	var fileSize *string
 	err := d.pool.QueryRow(ctx,
-		"SELECT tags, rating FROM eh_galleries WHERE gid = $1", gid,
-	).Scan(&tagsJSON, &rating)
+		"SELECT tags, rating, file_size FROM eh_galleries WHERE gid = $1", gid,
+	).Scan(&tagsJSON, &rating, &fileSize)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -481,7 +560,8 @@ func (d *DB) GetGalleryByGID(ctx context.Context, gid int64) (map[string]any, er
 		return nil, err
 	}
 	result := map[string]any{
-		"rating": rating,
+		"rating":    rating,
+		"file_size": fileSize,
 	}
 	var tags map[string][]string
 	_ = json.Unmarshal(tagsJSON, &tags)
