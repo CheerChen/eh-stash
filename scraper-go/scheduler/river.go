@@ -282,7 +282,7 @@ func (s *Scheduler) newRiverClient(ctx context.Context) (*river.Client[pgx.Tx], 
 		periodicJobs = append(periodicJobs, river.NewPeriodicJob(
 			river.PeriodicInterval(interval),
 			func() (river.JobArgs, *river.InsertOpts) {
-				return RefreshDetailArgs{TaskID: taskID}, uniqueInsertOpts()
+				return RefreshDetailArgs{TaskID: taskID}, activeUniqueInsertOpts()
 			},
 			&river.PeriodicJobOpts{ID: fmt.Sprintf("refresh-detail-%d", taskID), RunOnStart: false},
 		))
@@ -422,7 +422,7 @@ func (s *Scheduler) enqueueTaskDef(ctx context.Context, riverClient *river.Clien
 			jobKind = res.Job.Kind
 		}
 	case def.Source == "refresh_detail" && def.Strategy == "refresh":
-		res, insertErr := riverClient.Insert(ctx, RefreshDetailArgs{TaskID: def.ID}, uniqueInsertOpts())
+		res, insertErr := riverClient.Insert(ctx, RefreshDetailArgs{TaskID: def.ID}, activeUniqueInsertOpts())
 		err = insertErr
 		if res != nil && res.Job != nil {
 			jobID = res.Job.ID
