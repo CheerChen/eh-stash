@@ -26,6 +26,10 @@ var banRE = regexp.MustCompile(
 	`(?i)ban expires in\s+(?:(\d+)\s*hours?)?\s*,?\s*(?:(\d+)\s*minutes?)?\s*(?:and\s+)?(?:(\d+)\s*seconds?)?`,
 )
 
+// BanEventFunc is called when a ban is detected, so the caller can
+// persist the event (e.g. write to sync_task_events for the API to pick up).
+type BanEventFunc func(durationSecs int, pageURL string)
+
 // Client wraps an HTTP client with TLS fingerprinting, rate limiting, and ban detection.
 //
 // http      — uTLS-fingerprinted, used for exhentai.org main site (anti-CF).
@@ -40,6 +44,12 @@ type Client struct {
 	cfg       *config.Config
 	egress    *egress.Manager
 	limiter   *ratelimit.Limiter
+	onBan     BanEventFunc
+}
+
+// SetBanEventHandler registers a callback invoked when a ban is detected.
+func (c *Client) SetBanEventHandler(f BanEventFunc) {
+	c.onBan = f
 }
 
 // New creates a Client with uTLS Chrome fingerprint and optional proxy.
@@ -137,6 +147,44 @@ func (c *Client) ProbeAccess(ctx context.Context, mode egress.Mode) error {
 	return nil
 }
 
+// BanProbe checks whether the ban is still active without going through
+// the rate limiter (to avoid deadlock when called from waitBan).
+// Returns stillBanned=true if the ban page is served, false if the site
+// responds normally, or an error if the probe was inconclusive.
+func (c *Client) BanProbe(ctx context.Context) (bool, error) {
+	mode := c.currentMode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.cfg.ExBaseURL, nil)
+	if err != nil {
+		return false, err
+	}
+	for k, vals := range c.cfg.Headers {
+		for _, v := range vals {
+			req.Header.Set(k, v)
+		}
+	}
+
+	resp, err := c.do(req, mode)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	body := string(bodyBytes)
+
+	if strings.Contains(body, "temporarily banned") || strings.Contains(body, "IP address has been") {
+		return true, nil
+	}
+	if resp.StatusCode == 200 && len(body) > 100 {
+		return false, nil
+	}
+	return false, fmt.Errorf("inconclusive probe: status=%d len=%d", resp.StatusCode, len(body))
+}
+
 func (c *Client) fetchPageWithMode(ctx context.Context, pageURL string, mode egress.Mode, report bool) (string, string, error) {
 	if err := c.limiter.Acquire(ctx); err != nil {
 		return "", ResultError, err
@@ -172,6 +220,9 @@ func (c *Client) fetchPageWithMode(ctx context.Context, pageURL string, mode egr
 	if strings.Contains(body, "temporarily banned") || strings.Contains(body, "IP address has been") {
 		secs := parseBanSeconds(body)
 		c.limiter.SetBan(time.Duration(secs) * time.Second)
+		if c.onBan != nil {
+			c.onBan(secs, pageURL)
+		}
 		if report {
 			c.reportFailure(mode, egress.ErrKindBan, nil)
 		}

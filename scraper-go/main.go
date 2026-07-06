@@ -79,6 +79,13 @@ func main() {
 	egressMgr.SetProber(func(ctx context.Context, mode egress.Mode) error {
 		return httpClient.ProbeAccess(ctx, mode)
 	})
+	mainLimiter.SetBanProber(httpClient.BanProbe)
+	httpClient.SetBanEventHandler(func(secs int, pageURL string) {
+		slog.Warn("ban detected, writing event", "duration", secs, "url", pageURL)
+		_ = database.InsertTaskEvent(context.Background(), 0, nil, "proxy.banned",
+			"IP temporarily banned",
+			map[string]any{"duration_secs": secs, "url": pageURL})
+	})
 
 	// Signal channels for workers
 	signals := &scheduler.Signals{
