@@ -63,6 +63,10 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       TAG_BLACKLIST: ${TAG_BLACKLIST}
       THUMB_DIR: /data/thumbs
+      EX_COOKIES: ${EX_COOKIES:-}
+      EX_BASE_URL: ${EX_BASE_URL:-https://exhentai.org}
+      MIHOMO_API: ${MIHOMO_API:-}
+      PROXY_URL: ${PROXY_URL:-}
     volumes:
       - /opt/eh-stash/thumbs:/data/thumbs
     restart: unless-stopped
