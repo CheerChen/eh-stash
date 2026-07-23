@@ -241,8 +241,12 @@ func (c *Client) fetchPageWithMode(ctx context.Context, pageURL string, mode egr
 
 	// A removed detail page is a content state, not an egress failure. Callers
 	// that reconcile stored galleries can mark the row inactive instead of
-	// retrying it forever or rotating a healthy proxy.
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+	// retrying it forever or rotating a healthy proxy. Besides the HTTP 404/410
+	// case, e-hentai serves a soft-404 for removed or version-reverted galleries:
+	// HTTP 200 with a short plain-text "Gallery not found" body and no gallery
+	// markup. Without this, such rows fail to parse and are retried every pass.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone ||
+		(resp.StatusCode == 200 && strings.Contains(body, "Gallery not found")) {
 		if report {
 			c.reportSuccess(mode)
 		}
